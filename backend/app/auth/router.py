@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Request, Response
 
 from app.api.dependencies import CSRF, DB, Identity
-from app.auth.schemas import AuthUserResponse, LoginRequest
+from app.auth.schemas import AuthUserResponse, LoginRequest, RegisterRequest
 from app.auth.service import (
+    create_guest_session,
     ensure_csrf,
     login,
+    register_applicant,
     revoke_all_sessions,
     revoke_session,
 )
@@ -27,6 +29,41 @@ async def login_route(
         request.state.request_id,
         request.client.host if request.client else None,
         request.headers.get("User-Agent"),
+    )
+    _set_auth_cookies(response, session_token, csrf_token)
+    return {"data": _auth_user(user, csrf_token)}
+
+
+@router.post("/register", status_code=201)
+async def register_route(
+    payload: RegisterRequest,
+    request: Request,
+    response: Response,
+    db: DB,
+) -> dict:
+    user, session_token, csrf_token = await register_applicant(
+        db,
+        payload,
+        request_id=request.state.request_id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("User-Agent"),
+    )
+    _set_auth_cookies(response, session_token, csrf_token)
+    return {"data": _auth_user(user, csrf_token)}
+
+
+@router.post("/guest", status_code=201)
+async def guest_route(
+    request: Request,
+    response: Response,
+    db: DB,
+) -> dict:
+    """游客会话：随机账号 + applicant 角色，让学生扫码即用，无需注册登录。"""
+    user, session_token, csrf_token = await create_guest_session(
+        db,
+        request_id=request.state.request_id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("User-Agent"),
     )
     _set_auth_cookies(response, session_token, csrf_token)
     return {"data": _auth_user(user, csrf_token)}

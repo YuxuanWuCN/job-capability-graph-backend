@@ -2,6 +2,7 @@ from io import BytesIO
 
 import pytest
 from docx import Document
+from pypdf import PdfWriter
 
 from app.core.errors import APIError
 from app.recruitment.parsing import (
@@ -11,7 +12,7 @@ from app.recruitment.parsing import (
     validate_jd_evidence,
 )
 from app.recruitment.schemas import RecruitmentJDParseResponse
-from app.resumes.parsing import DOCX_MEDIA_TYPE
+from app.resumes.parsing import DOCX_MEDIA_TYPE, MAX_RESUME_PDF_PAGES
 from tests.test_recruitment_schemas import VALID_JD_PARSE
 
 
@@ -30,6 +31,7 @@ def make_docx_bytes(text: str = "负责 Python 开发") -> bytes:
         ("jd.docx", DOCX_MEDIA_TYPE, make_docx_bytes(), "docx"),
         ("jd.txt", "text/plain", "岗位职责".encode(), "txt"),
     ],
+    ids=["pdf", "docx", "txt"],
 )
 def test_detect_jd_document_supports_three_formats(
     filename,
@@ -52,6 +54,7 @@ def test_detect_jd_document_supports_three_formats(
             "RECRUITMENT_JD_TOO_LARGE",
         ),
     ],
+    ids=["unsupported_ext", "bad_pdf_sig", "too_large"],
 )
 def test_detect_jd_document_rejects_invalid_inputs(
     filename,
@@ -83,6 +86,20 @@ async def test_extract_jd_text_reuses_docx_parser(tmp_path) -> None:
 
     assert result.text == "负责 Python 开发"
     assert result.method == "docx"
+
+
+async def test_extract_jd_text_rejects_pdf_over_page_limit(tmp_path) -> None:
+    path = tmp_path / "jd_over_limit.pdf"
+    writer = PdfWriter()
+    for _ in range(MAX_RESUME_PDF_PAGES + 1):
+        writer.add_blank_page(width=612, height=792)
+    writer.write(path)
+
+    with pytest.raises(APIError) as error:
+        await extract_jd_text(path, "pdf")
+
+    assert error.value.status_code == 413
+    assert error.value.code == "RECRUITMENT_JD_TOO_LARGE"
 
 
 def test_validate_jd_evidence_drops_unanchored_items() -> None:

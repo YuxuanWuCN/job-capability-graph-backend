@@ -40,6 +40,7 @@ SAFE_MESSAGES = {
     "RESUME_DOCUMENT_INVALID": "简历文档无法解析",
     "RESUME_TEXT_EMPTY": "简历中没有可提取文字",
     "RESUME_TEXT_TOO_LONG": "简历正文超过处理上限",
+    "RESUME_PDF_TOO_MANY_PAGES": "简历请控制在 30 页内",
     "LLM_NOT_CONFIGURED": "简历解析服务尚未配置",
     "LLM_TIMEOUT": "简历解析服务请求超时",
     "LLM_RATE_LIMITED": "简历解析服务暂时繁忙",

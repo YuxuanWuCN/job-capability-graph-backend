@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { Suspense, lazy, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   CheckOutlined,
@@ -8,13 +8,18 @@ import {
   FilterOutlined,
   SearchOutlined,
 } from '@ant-design/icons'
-import { GraphScene3D } from '../components/GraphScene3D'
 import { FrameCorners } from '../components/FrameCorners'
+import { MobileGraph2DView } from '../components/MobileGraph2DView'
+import { useViewMode } from '../context/ViewModeContext'
 import MOCK_GRAPH_DATA from '../data/mockGraphData'
 import { fetchGraphData } from '../services/graphApi'
 import type { GraphData, Planet, Star } from '../types/graph'
 import { findGraphStarForRole } from '../utils/graphRoleMatch'
 import AuthGate from '../components/AuthGate'
+
+const LazyGraphScene3D = lazy(() =>
+  import('../components/GraphScene3D').then((mod) => ({ default: mod.GraphScene3D })),
+)
 
 const typeColor: Record<string, string> = {
   core: '#ee1212',
@@ -28,11 +33,14 @@ const typeLabel: Record<string, string> = {
   frontier: '前沿技能',
 }
 
-const FEATURED_LIMIT = 8
+const FEATURED_LIMIT = 12
 const AUTO_HIDE_LABEL_LIMIT = 48
 const AUTO_HIDE_SKILL_LABEL_LIMIT = 320
 
+type GraphScopeMode = 'featured' | 'official' | 'emerging' | 'all'
+
 function GraphWorkspace() {
+  const { isMobile } = useViewMode()
   const [searchParams] = useSearchParams()
   const [graphData, setGraphData] = useState<GraphData>(MOCK_GRAPH_DATA)
   const [loading, setLoading] = useState(true)
@@ -43,8 +51,10 @@ function GraphWorkspace() {
   const [showJobLabels, setShowJobLabels] = useState(true)
   const [showSkillLabels, setShowSkillLabels] = useState(true)
   const [selectedJobIds, setSelectedJobIds] = useState<string[]>([])
+  const [scopeMode, setScopeMode] = useState<GraphScopeMode>('featured')
   const [searchQuery, setSearchQuery] = useState('')
   const [jobPickerOpen, setJobPickerOpen] = useState(false)
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
   const [routeJobApplied, setRouteJobApplied] = useState(false)
   const routeJobName = searchParams.get('job') ?? ''
   const routeJobId = searchParams.get('jobId') ?? ''
@@ -108,6 +118,15 @@ function GraphWorkspace() {
     })
   }, [graphData.stars, searchQuery])
 
+  const officialStars = useMemo(
+    () => graphData.stars.filter((star) => !star.isEmerging),
+    [graphData.stars],
+  )
+  const emergingStars = useMemo(
+    () => graphData.stars.filter((star) => star.isEmerging),
+    [graphData.stars],
+  )
+
   const selectedJobIdSet = useMemo(() => new Set(selectedJobIds), [selectedJobIds])
   const candidateStars = searchQuery.trim() ? searchResults : graphData.stars
   const visibleStars = useMemo(() => {
@@ -115,8 +134,21 @@ function GraphWorkspace() {
       return graphData.stars.filter((star) => selectedJobIdSet.has(star.id))
     }
     if (searchQuery.trim()) return searchResults
+    if (scopeMode === 'official') return officialStars
+    if (scopeMode === 'emerging') return emergingStars
+    if (scopeMode === 'all') return graphData.stars
     return featuredStars.length > 0 ? featuredStars : graphData.stars.slice(0, FEATURED_LIMIT)
-  }, [featuredStars, graphData.stars, searchQuery, searchResults, selectedJobIdSet, selectedJobIds.length])
+  }, [
+    emergingStars,
+    featuredStars,
+    graphData.stars,
+    officialStars,
+    scopeMode,
+    searchQuery,
+    searchResults,
+    selectedJobIdSet,
+    selectedJobIds.length,
+  ])
 
   const visibleStarIds = useMemo(() => new Set(visibleStars.map((star) => star.id)), [visibleStars])
   const visiblePlanets = useMemo(
@@ -156,7 +188,13 @@ function GraphWorkspace() {
       ? `${selectedJobIds.length} 个岗位`
       : searchQuery.trim()
         ? `${searchResults.length} 个搜索结果`
-        : `热门新兴 ${Math.min(FEATURED_LIMIT, featuredStars.length || graphData.stars.length)}`
+        : scopeMode === 'all'
+          ? `全量 ${graphData.stars.length} 个岗位`
+          : scopeMode === 'official'
+            ? `正式岗位 ${officialStars.length}`
+            : scopeMode === 'emerging'
+              ? `新兴候选 ${emergingStars.length}`
+              : `核心+热门 ${Math.min(FEATURED_LIMIT, featuredStars.length || graphData.stars.length)}`
 
   const currentViewLabel = isAllSelected
     ? '全量岗位星系'
@@ -164,7 +202,13 @@ function GraphWorkspace() {
       ? `已筛选 ${selectedJobIds.length} 个岗位`
       : searchQuery.trim()
         ? `搜索命中 ${visibleStars.length} 个岗位`
-        : '默认热门新兴岗位'
+        : scopeMode === 'all'
+          ? `全量 ${graphData.stars.length} 个岗位`
+          : scopeMode === 'official'
+            ? '正式发布岗位'
+            : scopeMode === 'emerging'
+              ? '新兴岗位候选'
+              : '核心岗位与热门新兴'
 
   const planetStar = selectedPlanet ? graphData.stars.find((star) => star.id === selectedPlanet.starId) : null
   const effectiveShowJobLabels = showJobLabels && visibleStars.length <= AUTO_HIDE_LABEL_LIMIT
@@ -185,13 +229,19 @@ function GraphWorkspace() {
     ))
   }
 
-  const showFeaturedView = () => {
+  const applyScopeMode = (mode: GraphScopeMode) => {
+    setScopeMode(mode)
     setSelectedJobIds([])
     setSearchQuery('')
     closeDetail()
   }
 
+  const showFeaturedView = () => {
+    applyScopeMode('featured')
+  }
+
   const selectAllJobs = () => {
+    setScopeMode('all')
     setSelectedJobIds(graphData.stars.map((star) => star.id))
     closeDetail()
   }
@@ -215,6 +265,26 @@ function GraphWorkspace() {
     setSelectedPlanet(planet)
     setSelectedStar(null)
   }
+
+  const handleReverseStarJump = (star: Star) => {
+    if (!visibleStarIds.has(star.id)) {
+      setSearchQuery('')
+      setSelectedJobIds((prev) =>
+        prev.length > 0
+          ? prev.includes(star.id)
+            ? prev
+            : [...prev, star.id]
+          : [...visibleStars.map((item) => item.id), star.id],
+      )
+    }
+    setSelectedStar(star)
+    setSelectedPlanet(null)
+  }
+
+  const activeMobileStar =
+    (selectedStar && visibleStarIds.has(selectedStar.id) ? selectedStar : null) ??
+    visibleStars[0] ??
+    null
 
   useEffect(() => {
     if (routeJobApplied || loading || (!routeJobName && !routeJobId)) return
@@ -321,142 +391,218 @@ function GraphWorkspace() {
           <h1>岗位-技能星图</h1>
           <p>{currentViewLabel}</p>
 
-          <div className="graph-search-control archive-control">
-            <SearchOutlined />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
-              placeholder="搜索岗位、公司、技能"
-            />
-            {searchQuery && (
-              <button type="button" onClick={() => setSearchQuery('')} aria-label="清空搜索">
-                <CloseOutlined />
-              </button>
-            )}
-          </div>
-
-          {renderJobPicker()}
-
-          <div className="graph-control-section">
-            <div className="graph-control-section__title">技能轨道</div>
-            <div className="graph-filter-stack">
-              {(['core', 'foundation', 'frontier'] as const).map((type) => (
-                <label key={type} className="graph-filter">
-                  <input
-                    type="checkbox"
-                    checked={filterTypes.includes(type)}
-                    onChange={() => toggleFilterType(type)}
-                    style={{ accentColor: typeColor[type] }}
-                  />
-                  <span className="graph-filter__dot" style={{ background: typeColor[type] }} />
-                  <span>{typeLabel[type]}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-
-          <div className="graph-control-section">
-            <div className="graph-control-section__title">文字层</div>
-            <div className="graph-filter-stack graph-filter-stack--compact">
-              <label className="graph-filter">
-                <input
-                  type="checkbox"
-                  checked={showJobLabels}
-                  onChange={(event) => setShowJobLabels(event.target.checked)}
-                  style={{ accentColor: '#e4b592' }}
-                />
-                岗位标签
-              </label>
-              <label className="graph-filter">
-                <input
-                  type="checkbox"
-                  checked={showSkillLabels}
-                  onChange={(event) => setShowSkillLabels(event.target.checked)}
-                  style={{ accentColor: '#ee1212' }}
-                />
-                技能标签
-              </label>
-            </div>
-          </div>
-
-          <div className="graph-data-strip">
-            <div>
-              <span>显示岗位</span>
-              <strong>{visibleStars.length}</strong>
-            </div>
-            <div>
-              <span>技能节点</span>
-              <strong>{visiblePlanets.length}</strong>
-            </div>
-            <div>
-              <span>JD 总量</span>
-              <strong>{totalJobs.toLocaleString('zh-CN')}</strong>
-            </div>
-          </div>
-
-          <div className="graph-source-mix">
-            <span>{totalCategories} 个岗位类别</span>
-            {sourceSummary.map(([source, count]) => (
-              <strong key={source}>
-                {source} {count.toLocaleString('zh-CN')}
-              </strong>
-            ))}
-          </div>
-
-          {selectedJobs.length > 0 && (
-            <div className="graph-selected-jobs">
-              {selectedJobs.slice(0, 6).map((star) => (
-                <button
-                  key={star.id}
-                  type="button"
-                  onClick={() => toggleJobSelection(star.id)}
-                  style={{ borderColor: `${star.color}88` }}
-                >
-                  <span style={{ background: star.color }} />
-                  {star.label}
+          <div className="graph-control-panel__mobile-bar">
+            <div className="graph-search-control archive-control">
+              <SearchOutlined />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="搜索岗位、公司、技能"
+              />
+              {searchQuery && (
+                <button type="button" onClick={() => setSearchQuery('')} aria-label="清空搜索">
                   <CloseOutlined />
                 </button>
-              ))}
-              {selectedJobs.length > 6 && <em>+{selectedJobs.length - 6}</em>}
+              )}
             </div>
-          )}
-        </aside>
-
-        <section className="graph-canvas-frame graph-canvas-frame--archive relative overflow-hidden">
-          <FrameCorners />
-          <GraphScene3D
-            data={{
-              stars: visibleStars,
-              planets: visiblePlanets,
-              metadata: graphData.metadata,
-            }}
-            selectedStar={selectedStar}
-            selectedPlanet={selectedPlanet}
-            onStarClick={handleStarClick}
-            onPlanetClick={handlePlanetClick}
-            showJobLabels={effectiveShowJobLabels}
-            showSkillLabels={effectiveShowSkillLabels}
-            filterTypes={filterTypes}
-          />
-
-          <div className="graph-canvas-readout archive-panel glass">
-            <span>{visibleStars.length} JOB NODES</span>
-            <strong>{visiblePlanets.length} SKILL ORBITS</strong>
+            <button
+              type="button"
+              className={`graph-mobile-filter-toggle archive-control ${mobileFiltersOpen ? 'is-open' : ''}`}
+              onClick={() => setMobileFiltersOpen((value) => !value)}
+              aria-expanded={mobileFiltersOpen}
+            >
+              <FilterOutlined />
+              <span>{mobileFiltersOpen ? '收起筛选' : '筛选'}</span>
+              <em>{visibleStars.length} 岗</em>
+            </button>
           </div>
 
-          {visibleStars.length === 0 && (
-            <div className="absolute inset-0 z-20 flex items-center justify-center pointer-events-none">
-              <div className="archive-panel glass px-4 py-3 text-center max-w-[280px]">
-                <div className="text-xs text-[var(--text)] font-medium mb-1">没有找到匹配的岗位</div>
-                <div className="text-[10px] text-[var(--text-dim)]">清空搜索或换一个关键词</div>
-              </div>
+          {graphData.stars.length > 0 && (
+            <div className="graph-scope-bar" role="group" aria-label="岗位视图范围">
+              <button
+                type="button"
+                className={scopeMode === 'featured' && selectedJobIds.length === 0 && !searchQuery.trim() ? 'is-active' : ''}
+                onClick={() => applyScopeMode('featured')}
+              >
+                核心+热门
+              </button>
+              <button
+                type="button"
+                className={scopeMode === 'official' && selectedJobIds.length === 0 && !searchQuery.trim() ? 'is-active' : ''}
+                onClick={() => applyScopeMode('official')}
+              >
+                正式岗位 ({officialStars.length})
+              </button>
+              {emergingStars.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    className={scopeMode === 'emerging' && selectedJobIds.length === 0 && !searchQuery.trim() ? 'is-active' : ''}
+                    onClick={() => applyScopeMode('emerging')}
+                  >
+                    新兴候选 ({emergingStars.length})
+                  </button>
+                  <button
+                    type="button"
+                    className={scopeMode === 'all' && selectedJobIds.length === 0 && !searchQuery.trim() ? 'is-active' : ''}
+                    onClick={() => applyScopeMode('all')}
+                  >
+                    全部 ({graphData.stars.length})
+                  </button>
+                </>
+              )}
             </div>
           )}
-        </section>
+
+          <div className={`graph-control-panel__details ${mobileFiltersOpen ? 'is-open' : ''}`}>
+            {renderJobPicker()}
+
+            <div className="graph-control-section">
+              <div className="graph-control-section__title">技能轨道</div>
+              <div className="graph-filter-stack">
+                {(['core', 'foundation', 'frontier'] as const).map((type) => (
+                  <label key={type} className="graph-filter">
+                    <input
+                      type="checkbox"
+                      checked={filterTypes.includes(type)}
+                      onChange={() => toggleFilterType(type)}
+                      style={{ accentColor: typeColor[type] }}
+                    />
+                    <span className="graph-filter__dot" style={{ background: typeColor[type] }} />
+                    <span>{typeLabel[type]}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {!isMobile && (
+              <div className="graph-control-section">
+                <div className="graph-control-section__title">文字层</div>
+                <div className="graph-filter-stack graph-filter-stack--compact">
+                  <label className="graph-filter">
+                    <input
+                      type="checkbox"
+                      checked={showJobLabels}
+                      onChange={(event) => setShowJobLabels(event.target.checked)}
+                      style={{ accentColor: '#e4b592' }}
+                    />
+                    岗位标签
+                  </label>
+                  <label className="graph-filter">
+                    <input
+                      type="checkbox"
+                      checked={showSkillLabels}
+                      onChange={(event) => setShowSkillLabels(event.target.checked)}
+                      style={{ accentColor: '#ee1212' }}
+                    />
+                    技能标签
+                  </label>
+                </div>
+              </div>
+            )}
+
+            <div className="graph-data-strip">
+              <div>
+                <span>显示岗位</span>
+                <strong>{visibleStars.length}</strong>
+              </div>
+              <div>
+                <span>技能节点</span>
+                <strong>{visiblePlanets.length}</strong>
+              </div>
+              <div>
+                <span>JD 总量</span>
+                <strong>{totalJobs.toLocaleString('zh-CN')}</strong>
+              </div>
+            </div>
+
+            <div className="graph-source-mix">
+              <span>{totalCategories} 个岗位类别</span>
+              {sourceSummary.map(([source, count]) => (
+                <strong key={source}>
+                  {source} {count.toLocaleString('zh-CN')}
+                </strong>
+              ))}
+            </div>
+
+            {selectedJobs.length > 0 && (
+              <div className="graph-selected-jobs">
+                {selectedJobs.slice(0, 6).map((star) => (
+                  <button
+                    key={star.id}
+                    type="button"
+                    onClick={() => toggleJobSelection(star.id)}
+                    style={{ borderColor: `${star.color}88` }}
+                  >
+                    <span style={{ background: star.color }} />
+                    {star.label}
+                    <CloseOutlined />
+                  </button>
+                ))}
+                {selectedJobs.length > 6 && <em>+{selectedJobs.length - 6}</em>}
+              </div>
+            )}
+          </div>
+        </aside>
+
+        {isMobile ? (
+          <MobileGraph2DView
+            mode="explorer"
+            stars={visibleStars}
+            planets={visiblePlanets}
+            activeStar={activeMobileStar}
+            selectedPlanet={selectedPlanet}
+            onSelectStar={(star) => {
+              setSelectedStar(star)
+              setSelectedPlanet(null)
+            }}
+            onSelectPlanet={(planet) => setSelectedPlanet(planet)}
+          />
+        ) : (
+          <section className="graph-canvas-frame graph-canvas-frame--archive relative overflow-hidden">
+            <FrameCorners />
+            <Suspense
+              fallback={(
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="loading-reticle" />
+                </div>
+              )}
+            >
+              <LazyGraphScene3D
+                data={{
+                  stars: visibleStars,
+                  planets: visiblePlanets,
+                  metadata: graphData.metadata,
+                }}
+                selectedStar={selectedStar}
+                selectedPlanet={selectedPlanet}
+                onStarClick={handleStarClick}
+                onPlanetClick={handlePlanetClick}
+                showJobLabels={effectiveShowJobLabels}
+                showSkillLabels={effectiveShowSkillLabels}
+                filterTypes={filterTypes}
+              />
+            </Suspense>
+
+            <div className="graph-canvas-readout archive-panel glass">
+              <span>{visibleStars.length} JOB NODES</span>
+              <strong>{visiblePlanets.length} SKILL ORBITS</strong>
+            </div>
+
+            {visibleStars.length === 0 && (
+              <div className="absolute inset-0 z-20 flex items-center justify-center pointer-events-none">
+                <div className="archive-panel glass px-4 py-3 text-center max-w-[280px]">
+                  <div className="text-xs text-[var(--text)] font-medium mb-1">没有找到匹配的岗位</div>
+                  <div className="text-[10px] text-[var(--text-dim)]">清空搜索或换一个关键词</div>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
       </div>
 
-      {selectedStar && (
+      {!isMobile && selectedStar && (
         <>
           <div className="drawer-mask" onClick={closeDetail} />
           <div className="drawer drawer--archive graph-detail-drawer">
@@ -597,7 +743,7 @@ function GraphWorkspace() {
                 {graphData.stars
                   .filter((star) => [...star.requiredSkills, ...star.bonusSkills].includes(selectedPlanet.label))
                   .map((star) => (
-                    <button key={star.id} type="button" className="archive-row glass" onClick={() => handleStarClick(star)}>
+                    <button key={star.id} type="button" className="archive-row glass" onClick={() => handleReverseStarJump(star)}>
                       <div className="graph-sample-list__dot" style={{ background: star.color }} />
                       <div>
                         <strong>{star.label}</strong>

@@ -134,7 +134,7 @@ def _ground_items(
 
 
 def _translate_resume_error(error: APIError) -> APIError:
-    if error.code == "RESUME_TEXT_TOO_LONG":
+    if error.code in {"RESUME_TEXT_TOO_LONG", "RESUME_PDF_TOO_MANY_PAGES"}:
         return APIError(413, "RECRUITMENT_JD_TOO_LARGE", "JD 正文超过处理上限")
     return _invalid_document()
 

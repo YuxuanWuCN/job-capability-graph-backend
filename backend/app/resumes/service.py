@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -28,8 +29,11 @@ from app.resumes.llm import LLMParseResult
 from app.resumes.models import Resume, ResumeProfile, ResumeSkill
 from app.resumes.parsing import (
     DOCX_MEDIA_TYPE,
+    DOCX_MEDIA_TYPES,
     MAX_RESUME_FILE_BYTES,
+    PDF_MEDIA_TYPES,
     ValidatedParse,
+    build_docx_from_plain_text,
     derive_highest_education,
     derive_total_experience_months,
     detect_resume_document,
@@ -50,8 +54,8 @@ from app.worker import celery_app
 
 storage = FileStorage(get_settings().file_storage_root)
 ALLOWED_RESUME_MEDIA_TYPES = {
-    "pdf": {"application/pdf", "application/octet-stream"},
-    "docx": {DOCX_MEDIA_TYPE, "application/octet-stream"},
+    "pdf": PDF_MEDIA_TYPES,
+    "docx": DOCX_MEDIA_TYPES,
 }
 
 
@@ -350,7 +354,7 @@ def require_resume_reader(actor: User) -> None:
 
 
 def require_resume_creator(actor: User) -> None:
-    if actor.role != "applicant":
+    if actor.role not in {"applicant", "admin"}:
         raise APIError(403, "ROLE_NOT_ALLOWED", "当前角色不能创建应聘者简历")
 
 
@@ -389,7 +393,11 @@ async def create_resume(
         raise APIError(422, "VALIDATION_FAILED", "简历文件名过长")
     extension = Path(original_name).suffix.lower().lstrip(".")
     media_type = (
-        (upload.content_type or "application/octet-stream").split(";", 1)[0].lower()
+        (upload.content_type or "application/octet-stream")
+        .split(";", 1)[0]
+        .strip()
+        .lower()
+        or "application/octet-stream"
     )
     if (
         extension not in ALLOWED_RESUME_MEDIA_TYPES
@@ -444,12 +452,115 @@ async def create_resume(
             _remove_resume_file(storage_key)
             return _reuse_resume_idempotency(existing, request_hash)
 
+    return await _create_resume_records(
+        db,
+        actor=actor,
+        file_id=file_id,
+        resume_id=resume_id,
+        run_id=run_id,
+        original_name=original_name,
+        storage_key=storage_key,
+        media_type="application/pdf" if document_type == "pdf" else DOCX_MEDIA_TYPE,
+        extension=extension,
+        size_bytes=size_bytes,
+        file_sha256=file_sha256,
+        display_name=normalized_display_name,
+        request_hash=request_hash,
+        idempotency_key=idempotency_key,
+        endpoint_key="resumes.create",
+        audit_action="resume.create",
+        request_id=request_id,
+        ip_address=ip_address,
+    )
+
+
+async def create_resume_from_text(
+    db: AsyncSession,
+    actor: User,
+    *,
+    text: str,
+    display_name: str | None,
+    idempotency_key: str | None,
+    request_id: str,
+    ip_address: str | None,
+) -> ResumeCreatedResponse:
+    require_resume_creator(actor)
+    docx_bytes = build_docx_from_plain_text(text)
+    normalized_display_name = (display_name or "").strip() or "粘贴文本简历"
+    if len(normalized_display_name) > 200:
+        raise APIError(422, "VALIDATION_FAILED", "简历名称长度无效")
+    original_name = (
+        normalized_display_name
+        if normalized_display_name.lower().endswith(".docx")
+        else f"{normalized_display_name[:195]}.docx"
+    )
+    size_bytes = len(docx_bytes)
+    file_sha256 = hashlib.sha256(docx_bytes).hexdigest()
+    request_hash = _resume_request_hash(file_sha256, normalized_display_name)
+    if idempotency_key:
+        existing = await _find_resume_idempotency(
+            db,
+            actor.id,
+            idempotency_key,
+            endpoint_key="resumes.create_text",
+        )
+        if existing is not None:
+            return _reuse_resume_idempotency(existing, request_hash)
+
+    file_id = uuid4()
+    resume_id = uuid4()
+    run_id = uuid4()
+    storage_key = f"resume/{file_id}.docx"
+    _write_storage_bytes(storage_key, docx_bytes)
+    return await _create_resume_records(
+        db,
+        actor=actor,
+        file_id=file_id,
+        resume_id=resume_id,
+        run_id=run_id,
+        original_name=original_name,
+        storage_key=storage_key,
+        media_type=DOCX_MEDIA_TYPE,
+        extension="docx",
+        size_bytes=size_bytes,
+        file_sha256=file_sha256,
+        display_name=normalized_display_name,
+        request_hash=request_hash,
+        idempotency_key=idempotency_key,
+        endpoint_key="resumes.create_text",
+        audit_action="resume.create_text",
+        request_id=request_id,
+        ip_address=ip_address,
+    )
+
+
+async def _create_resume_records(
+    db: AsyncSession,
+    *,
+    actor: User,
+    file_id: UUID,
+    resume_id: UUID,
+    run_id: UUID,
+    original_name: str,
+    storage_key: str,
+    media_type: str,
+    extension: str,
+    size_bytes: int,
+    file_sha256: str,
+    display_name: str,
+    request_hash: str,
+    idempotency_key: str | None,
+    endpoint_key: str,
+    audit_action: str,
+    request_id: str,
+    ip_address: str | None,
+) -> ResumeCreatedResponse:
     stored_file = StoredFile(
         id=file_id,
         uploaded_by_user_id=actor.id,
         original_name=original_name,
         storage_key=storage_key,
-        media_type="application/pdf" if document_type == "pdf" else DOCX_MEDIA_TYPE,
+        media_type=media_type,
         extension=extension,
         size_bytes=size_bytes,
         sha256=file_sha256,
@@ -476,7 +587,7 @@ async def create_resume(
         id=resume_id,
         owner_user_id=actor.id,
         file_id=file_id,
-        display_name=normalized_display_name,
+        display_name=display_name,
         source_language="zh-CN",
         parse_status="processing",
         latest_run_id=run_id,
@@ -492,7 +603,7 @@ async def create_resume(
     if idempotency_key:
         idempotency = IdempotencyRecord(
             user_id=actor.id,
-            endpoint_key="resumes.create",
+            endpoint_key=endpoint_key,
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             response_status=202,
@@ -505,7 +616,7 @@ async def create_resume(
     db.add_all([stored_file, run, resume])
     record_audit(
         db,
-        action="resume.create",
+        action=audit_action,
         resource_type="resume",
         resource_id=resume_id,
         actor_user_id=actor.id,
@@ -524,6 +635,7 @@ async def create_resume(
                 db,
                 actor.id,
                 idempotency_key,
+                endpoint_key=endpoint_key,
             )
             if existing is not None:
                 return _reuse_resume_idempotency(existing, request_hash)
@@ -1171,14 +1283,28 @@ async def _find_resume_idempotency(
     db: AsyncSession,
     user_id: UUID,
     idempotency_key: str,
+    *,
+    endpoint_key: str = "resumes.create",
 ) -> IdempotencyRecord | None:
     return await db.scalar(
         select(IdempotencyRecord).where(
             IdempotencyRecord.user_id == user_id,
-            IdempotencyRecord.endpoint_key == "resumes.create",
+            IdempotencyRecord.endpoint_key == endpoint_key,
             IdempotencyRecord.idempotency_key == idempotency_key,
         )
     )
+
+
+def _write_storage_bytes(storage_key: str, content: bytes) -> None:
+    destination = storage.resolve(storage_key)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(content)
+        os.replace(temporary, destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _reuse_resume_idempotency(

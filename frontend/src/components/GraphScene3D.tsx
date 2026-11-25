@@ -3,6 +3,7 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls, Stars as ThreeStars } from '@react-three/drei'
 import { Star } from './Star'
 import { Planet, PLANET_ORBIT_VISUAL_SCALE } from './Planet'
+import { useViewMode } from '../context/ViewModeContext'
 import type { Star as StarType, Planet as PlanetType, GraphData } from '../types/graph'
 
 interface Scene3DProps {
@@ -80,6 +81,7 @@ function Scene({
   const controlsRef = useRef<any>(null)
   const { camera } = useThree()
   const sceneView = useMemo(() => calculateSceneView(data), [data])
+  const { isMobile } = useViewMode()
 
   useLayoutEffect(() => {
     const [centerX, centerY, centerZ] = sceneView.center
@@ -117,7 +119,7 @@ function Scene({
       <pointLight position={sceneView.center} intensity={1.35} distance={sceneView.distance * 2.2} decay={2} />
 
       {/* Background stars */}
-      <ThreeStars radius={50} depth={50} count={2000} factor={3} saturation={0} fade speed={0.5} />
+      <ThreeStars radius={50} depth={50} count={isMobile ? 600 : 2000} factor={3} saturation={0} fade speed={0.5} />
 
       {/* Render visible stars */}
       {visibleStars.map((star) => (
@@ -168,6 +170,7 @@ function Scene({
 
 export function GraphScene3D(props: Scene3DProps) {
   const [webglReady, setWebglReady] = useState<boolean | null>(null)
+  const { isMobile } = useViewMode()
 
   useEffect(() => {
     try {
@@ -204,7 +207,7 @@ export function GraphScene3D(props: Scene3DProps) {
   return (
     <Canvas
       camera={{ position: [0, 10, 38], fov: 54 }}
-      dpr={[1, 1.5]}
+      dpr={isMobile ? [1, 1.25] : [1, 1.5]}
       gl={{ antialias: true, alpha: false, powerPreference: 'high-performance' }}
       onCreated={({ gl }) => {
         gl.setClearColor('#000000', 1)

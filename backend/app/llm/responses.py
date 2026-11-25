@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -9,7 +10,12 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from app.core.config import get_settings
+
 logger = logging.getLogger(__name__)
+
+CHAT_MAX_TOKENS_CAP = 8192
+OCR_MAX_TOKENS = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +72,20 @@ class StructuredResponsesClient:
         ]
         | None = None,
     ) -> StructuredResponseResult[T]:
+        if get_settings().llm_api_style == "chat":
+            return await self._generate_chat(
+                url=url,
+                api_key=api_key,
+                model=model,
+                instructions=instructions,
+                input_text=input_text,
+                schema_name=schema_name,
+                response_model=response_model,
+                metadata=metadata,
+                max_output_tokens=max_output_tokens,
+                request_id=request_id,
+            )
+
         body = {
             "model": model,
             "instructions": instructions,
@@ -126,6 +146,179 @@ class StructuredResponsesClient:
                 raise error
             if error.code == "LLM_RESPONSE_INCOMPLETE":
                 body["max_output_tokens"] = max_output_tokens * 2
+            await self.sleep(_retry_delay(error, response))
+
+        raise AssertionError("unreachable")
+
+    async def _generate_chat[T: BaseModel](
+        self,
+        *,
+        url: str,
+        api_key: str,
+        model: str,
+        instructions: str,
+        input_text: str,
+        schema_name: str,
+        response_model: type[T],
+        metadata: dict[str, str],
+        max_output_tokens: int,
+        request_id: str | None,
+    ) -> StructuredResponseResult[T]:
+        """把 Responses API 的调用语义翻译成 chat/completions（DeepSeek 等）。
+
+        instructions 与 JSON Schema 合并进 system 提示词，要求模型只输出 JSON 对象；
+        结构化保证由 pydantic 校验 + 失败重试兜底（供应商不支持严格 schema）。
+        """
+        schema_json = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        system_prompt = (
+            f"{instructions}\n\n"
+            "输出要求（json）：只输出一个合法的 json 对象，不要使用 Markdown 代码块，"
+            f"不要输出任何解释文字。该 json 对象（{schema_name}）必须严格符合"
+            f"下面的 JSON Schema，字段名与类型均不可更改：\n{schema_json}"
+        )
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": input_text},
+            ],
+            "max_tokens": max_output_tokens,
+            "stream": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if request_id is not None:
+            headers["X-Request-ID"] = request_id
+
+        use_json_mode = True
+        dropped_json_mode = False
+        attempt = 0
+        while attempt < 2:
+            attempt += 1
+            payload = dict(body)
+            if use_json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            response = None
+            try:
+                response = await self.http.post(url, headers=headers, json=payload)
+                if (
+                    response.status_code in {400, 422}
+                    and use_json_mode
+                    and not dropped_json_mode
+                ):
+                    logger.warning(
+                        "chat provider rejected response_format, retrying without it: "
+                        "operation=%s status=%s",
+                        metadata.get("operation"),
+                        response.status_code,
+                    )
+                    use_json_mode = False
+                    dropped_json_mode = True
+                    attempt -= 1
+                    continue
+                if response.status_code >= 400:
+                    raise _classify_http_error(response.status_code)
+                return _parse_chat_response(
+                    response,
+                    response_model=response_model,
+                    provider_attempts=attempt,
+                )
+            except httpx.TimeoutException:
+                error = ResponsesAPIError("LLM_TIMEOUT", "request", True)
+            except httpx.RequestError:
+                error = ResponsesAPIError("LLM_UPSTREAM_ERROR", "request", True)
+            except ResponsesAPIError as caught:
+                error = caught
+
+            logger.warning(
+                "chat attempt failed: operation=%s attempt=%s code=%s status=%s",
+                metadata.get("operation"),
+                attempt,
+                error.code,
+                error.http_status,
+            )
+            if not error.retryable or attempt >= 2:
+                raise error
+            if error.code == "LLM_RESPONSE_INCOMPLETE":
+                # DeepSeek 的 max_tokens 上限为 8192，超过会被供应商直接拒绝
+                body["max_tokens"] = min(max_output_tokens * 2, CHAT_MAX_TOKENS_CAP)
+            await self.sleep(_retry_delay(error, response))
+
+        raise AssertionError("unreachable")
+
+    async def ocr_images(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        model: str,
+        images: list[tuple[str, bytes]],
+        metadata: dict[str, str],
+        request_id: str | None = None,
+        max_output_tokens: int = OCR_MAX_TOKENS,
+    ) -> str:
+        """调用兼容 OpenAI Chat Completions 视觉接口识别简历图片中的文字。"""
+        if not images:
+            return ""
+        user_content: list[dict[str, Any]] = [
+            {"type": "text", "text": "请完整识别并逐字输出以下简历图片中的所有文字："}
+        ]
+        for media_type, data in images:
+            encoded = base64.b64encode(data).decode("ascii")
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{encoded}"},
+                }
+            )
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是高精度简历文字识别（OCR）引擎。"
+                        "请完整、忠实地逐字转写图片中的所有可读文字，按阅读顺序分段输出纯文本。"
+                        "不要编造内容，不要输出解释或 Markdown 代码块。"
+                    ),
+                },
+                {"role": "user", "content": user_content},
+            ],
+            "max_tokens": min(max_output_tokens, CHAT_MAX_TOKENS_CAP),
+            "stream": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if request_id is not None:
+            headers["X-Request-ID"] = request_id
+
+        for attempt in (1, 2):
+            response = None
+            try:
+                response = await self.http.post(url, headers=headers, json=body)
+                if response.status_code >= 400:
+                    raise _classify_http_error(response.status_code)
+                return _parse_ocr_chat_response(response)
+            except httpx.TimeoutException:
+                error = ResponsesAPIError("LLM_TIMEOUT", "request", True)
+            except httpx.RequestError:
+                error = ResponsesAPIError("LLM_UPSTREAM_ERROR", "request", True)
+            except ResponsesAPIError as caught:
+                error = caught
+
+            logger.warning(
+                "ocr chat attempt failed: operation=%s attempt=%s code=%s status=%s",
+                metadata.get("operation"),
+                attempt,
+                error.code,
+                error.http_status,
+            )
+            if not error.retryable or attempt == 2:
+                raise error
             await self.sleep(_retry_delay(error, response))
 
         raise AssertionError("unreachable")
@@ -268,3 +461,120 @@ def _usage(value: Any) -> dict[str, int | None]:
 
 def _optional_string(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _strip_json_fence(text: str) -> str:
+    """模型偶尔仍会包一层 ```json 代码块，这里剥掉。"""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _chat_usage(value: Any) -> dict[str, int | None]:
+    source = value if isinstance(value, dict) else {}
+    mapping = {
+        "input_tokens": "prompt_tokens",
+        "output_tokens": "completion_tokens",
+        "total_tokens": "total_tokens",
+    }
+    usage: dict[str, int | None] = {}
+    for target, source_key in mapping.items():
+        item = source.get(source_key)
+        usage[target] = (
+            item if isinstance(item, int) and not isinstance(item, bool) else None
+        )
+    return usage
+
+
+def _parse_chat_response[T: BaseModel](
+    response: httpx.Response,
+    *,
+    response_model: type[T],
+    provider_attempts: int,
+) -> StructuredResponseResult[T]:
+    try:
+        envelope = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ResponsesAPIError(
+            "LLM_RESPONSE_INVALID", "validate_response", True
+        ) from error
+    if not isinstance(envelope, dict):
+        raise ResponsesAPIError("LLM_RESPONSE_INVALID", "validate_response", True)
+
+    choices = envelope.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ResponsesAPIError("LLM_RESPONSE_INVALID", "validate_response", True)
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        message = {}
+    if message.get("refusal"):
+        raise ResponsesAPIError("LLM_RESPONSE_REFUSED", "validate_response", False)
+    if choice.get("finish_reason") == "length":
+        logger.warning("chat response truncated by max_tokens")
+        raise ResponsesAPIError("LLM_RESPONSE_INCOMPLETE", "validate_response", True)
+
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ResponsesAPIError("LLM_RESPONSE_INVALID", "validate_response", True)
+    output_text = _strip_json_fence(content)
+
+    try:
+        payload = response_model.model_validate_json(output_text)
+    except ValidationError as error:
+        logger.warning(
+            "chat schema validation failed: errors=%s",
+            [
+                {"loc": list(item["loc"]), "type": item["type"]}
+                for item in error.errors(include_input=False, include_context=False)
+            ],
+        )
+        raise ResponsesAPIError(
+            "LLM_RESPONSE_INVALID", "validate_response", True
+        ) from error
+    except ValueError as error:
+        logger.warning("chat output was not valid JSON")
+        raise ResponsesAPIError(
+            "LLM_RESPONSE_INVALID", "validate_response", True
+        ) from error
+
+    return StructuredResponseResult(
+        payload=payload,
+        response_id=_optional_string(envelope.get("id")),
+        returned_model=_optional_string(envelope.get("model")),
+        status="completed",
+        usage=_chat_usage(envelope.get("usage")),
+        provider_attempts=provider_attempts,
+        response_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+    )
+
+
+def _parse_ocr_chat_response(response: httpx.Response) -> str:
+    try:
+        envelope = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ResponsesAPIError(
+            "LLM_RESPONSE_INVALID", "validate_response", True
+        ) from error
+    if not isinstance(envelope, dict):
+        raise ResponsesAPIError("LLM_RESPONSE_INVALID", "validate_response", True)
+
+    choices = envelope.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ResponsesAPIError("LLM_RESPONSE_INVALID", "validate_response", True)
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        message = {}
+    if message.get("refusal"):
+        raise ResponsesAPIError("LLM_RESPONSE_REFUSED", "validate_response", False)
+    content = message.get("content")
+    if not isinstance(content, str):
+        raise ResponsesAPIError("LLM_RESPONSE_INVALID", "validate_response", True)
+    return _strip_json_fence(content).strip()

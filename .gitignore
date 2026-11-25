@@ -13,3 +13,18 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/.cache/
+
+# ===== 部署与凭据（绝不入库）=====
+deploy/_deploy_key
+deploy/_deploy_key.pub
+deploy/.env.production
+deploy/_ci_deploy_key
+deploy/_ci_deploy_key.pub
+*.tar.gz
+dist.tar.gz
+
+# ===== 真实个人信息（仓库为 PUBLIC，绝不入库）=====
+docs/攀登计划申报材料/
+
+# ===== 历史部署脚本：含硬编码生产账号密码，绝不入库 =====
+deploy/_steps/

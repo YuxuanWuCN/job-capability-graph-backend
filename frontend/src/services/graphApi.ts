@@ -183,8 +183,8 @@ function convertPublishedGraphData(
     })
   })
 
-  const allStars = [...emergingStars, ...stars]
-  const allPlanets = [...emergingPlanets, ...planets]
+  const allStars = [...stars, ...emergingStars]
+  const allPlanets = [...planets, ...emergingPlanets]
   return {
     stars: allStars,
     planets: allPlanets,
@@ -194,7 +194,10 @@ function convertPublishedGraphData(
       total_skills: new Set(allPlanets.map((planet) => planet.label)).size,
       total_planets: allPlanets.length,
       generated_at: apiData.graph_version.published_at,
-      featured_star_ids: allStars.slice(0, 8).map((star) => star.id),
+      featured_star_ids: [
+        ...stars.map((star) => star.id),
+        ...emergingStars.slice(0, 8).map((star) => star.id),
+      ],
     },
   }
 }

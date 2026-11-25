@@ -239,7 +239,7 @@ function HRWorkspace() {
               { key: 'jd', label: '1. JD 解析', children: <div className="workflow-section">
                 <SectionTitle title="提交岗位 JD" description="文本和文件二选一，后台将异步抽取职责、门槛和技能证据。" />
                 <Input.TextArea value={jdText} onChange={(event) => setJdText(event.target.value)} rows={10} maxLength={30000} placeholder="粘贴岗位职责、任职要求和技能要求" disabled={jdFile.length > 0} />
-                <Dragger accept=".pdf,.docx,.txt" maxCount={1} fileList={jdFile} beforeUpload={() => false} onChange={({ fileList }) => { setJdFile(fileList.slice(-1)); if (fileList.length) setJdText('') }}><p className="ant-upload-drag-icon"><CloudUploadOutlined /></p><p className="ant-upload-text">或上传 PDF / DOCX / TXT JD</p></Dragger>
+                <Dragger accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" maxCount={1} fileList={jdFile} beforeUpload={() => false} onChange={({ fileList }) => { setJdFile(fileList.slice(-1)); if (fileList.length) setJdText('') }}><p className="ant-upload-drag-icon"><CloudUploadOutlined /></p><p className="ant-upload-text">或上传 PDF / DOCX / TXT JD</p></Dragger>
                 {task && <TaskProgress run={task} />}<Button type="primary" size="large" icon={<FileSearchOutlined />} loading={working} disabled={!jdText.trim() && !jdFile.length} onClick={() => void submitJd()}>解析 JD</Button>
               </div> },
               { key: 'requirements', label: `2. 要求确认 (${requirements.length})`, disabled: !project.jd_draft_payload.job_title, children: <div className="workflow-section">
@@ -257,13 +257,13 @@ function HRWorkspace() {
               </div> },
               { key: 'candidates', label: `3. 候选人 (${candidates.length})`, disabled: !hasConfirmedRequirements, children: <div className="workflow-section">
                 <SectionTitle title="候选人简历" description="每批 1–20 份 PDF/DOCX，单份失败不会回滚已成功结果。" />
-                <Dragger multiple accept=".pdf,.docx" fileList={candidateFiles} beforeUpload={() => false} onChange={({ fileList }) => setCandidateFiles(fileList.slice(0, 20))}><p className="ant-upload-drag-icon"><CloudUploadOutlined /></p><p className="ant-upload-text">拖入候选人简历</p><p className="ant-upload-hint">已选 {candidateFiles.length} / 20 份</p></Dragger>
+                <Dragger multiple accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" fileList={candidateFiles} beforeUpload={() => false} onChange={({ fileList }) => setCandidateFiles(fileList.slice(0, 20))}><p className="ant-upload-drag-icon"><CloudUploadOutlined /></p><p className="ant-upload-text">拖入候选人简历</p><p className="ant-upload-hint">已选 {candidateFiles.length} / 20 份</p></Dragger>
                 {task && <TaskProgress run={task} />}<div className="button-row"><Button type="primary" loading={working} disabled={!candidateFiles.length} onClick={() => void uploadCandidates()}>上传并解析</Button><Button disabled={!readyCount || working} onClick={() => void runMatch()}>生成匹配快照</Button></div>
                 <div className="candidate-list">{candidates.map((candidate) => <div key={candidate.id}><UserOutlined /><strong>{candidate.display_name}</strong><Tag color={candidate.parse_status === 'ready' ? 'green' : candidate.parse_status === 'failed' ? 'red' : 'gold'}>{candidate.parse_status}</Tag><span>{formatDate(candidate.updated_at)}</span></div>)}</div>
               </div> },
               { key: 'results', label: `4. 匹配结果 (${results.length})`, disabled: !matchRuns.length, children: <div className="workflow-section">
                 <div className="section-title"><div><h2>候选人排名</h2><p>切换历史快照不会用当前 JD 或候选人数据覆盖旧结果。</p></div><Select className="run-select" value={selectedRunId} onChange={(value) => void switchRun(value)} options={matchRuns.map((run) => ({ value: run.id, label: `${formatDate(run.created_at)} · ${run.result_count} 人` }))} /></div>
-                <Table rowKey="candidate_id" pagination={false} dataSource={results} onRow={(row) => ({ onClick: () => void showResult(row) })} columns={[
+                <Table rowKey="candidate_id" pagination={false} scroll={{ x: 520 }} dataSource={results} onRow={(row) => ({ onClick: () => void showResult(row) })} columns={[
                   { title: '排名', dataIndex: 'rank', width: 72, render: (value: number) => `#${value}` },
                   { title: '候选人', render: (_value, row) => row.candidate.display_name || row.candidate_id },
                   { title: '匹配等级', dataIndex: 'match_level', render: (value: string) => <Tag color={value === 'high' ? 'green' : value === 'medium' ? 'gold' : 'red'}>{value}</Tag> },

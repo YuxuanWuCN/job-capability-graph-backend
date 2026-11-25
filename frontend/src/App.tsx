@@ -2,6 +2,7 @@ import { ConfigProvider, theme } from 'antd';
 import AppRouter from './routes';
 import { ThemeProvider } from './context/ThemeContext';
 import { AuthProvider } from './context/AuthContext';
+import { ViewModeProvider } from './context/ViewModeContext';
 
 function ThemedApp() {
   return (
@@ -29,11 +30,13 @@ function ThemedApp() {
 
 function App() {
   return (
-    <ThemeProvider>
-      <AuthProvider>
-        <ThemedApp />
-      </AuthProvider>
-    </ThemeProvider>
+    <ViewModeProvider>
+      <ThemeProvider>
+        <AuthProvider>
+          <ThemedApp />
+        </AuthProvider>
+      </ThemeProvider>
+    </ViewModeProvider>
   );
 }
 

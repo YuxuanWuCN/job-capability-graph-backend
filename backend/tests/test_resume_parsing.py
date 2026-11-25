@@ -5,11 +5,12 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import pytest
 from docx import Document
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 
 from app.core.errors import APIError
 from app.resumes.parsing import (
     DOCX_MEDIA_TYPE,
+    MAX_RESUME_PDF_PAGES,
     derive_highest_education,
     derive_total_experience_months,
     detect_resume_document,
@@ -166,6 +167,49 @@ async def test_blank_pdf_is_rejected_as_empty_text(tmp_path) -> None:
         await extract_resume_text(path, "pdf")
 
     assert error.value.code == "RESUME_TEXT_EMPTY"
+
+
+async def test_pdf_page_limit_rejects_over_30_pages(tmp_path) -> None:
+    path = tmp_path / "over_limit.pdf"
+    writer = PdfWriter()
+    for _ in range(MAX_RESUME_PDF_PAGES + 1):
+        writer.add_blank_page(width=612, height=792)
+    writer.write(path)
+
+    with pytest.raises(APIError) as error:
+        await extract_resume_text(path, "pdf")
+
+    assert error.value.status_code == 422
+    assert error.value.code == "RESUME_PDF_TOO_MANY_PAGES"
+    assert "30 页内" in error.value.message
+
+
+async def test_pdf_page_limit_allows_exact_boundary(tmp_path) -> None:
+    path = tmp_path / "boundary.pdf"
+    writer = PdfWriter()
+    for _ in range(MAX_RESUME_PDF_PAGES):
+        writer.add_blank_page(width=612, height=792)
+    writer.write(path)
+
+    with pytest.raises(APIError) as error:
+        await extract_resume_text(path, "pdf")
+
+    assert error.value.code == "RESUME_TEXT_EMPTY"
+
+
+async def test_extracts_multipage_pdf_and_releases_pages(tmp_path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "resume_text.pdf"
+    reader = PdfReader(fixture)
+    path = tmp_path / "multipage.pdf"
+    writer = PdfWriter()
+    writer.add_page(reader.pages[0])
+    writer.add_page(reader.pages[0])
+    writer.write(path)
+
+    result = await extract_resume_text(path, "pdf")
+
+    assert result.method == "pdf_text"
+    assert result.text.count("Python") >= 2
 
 
 def test_redaction_is_length_preserving() -> None:
@@ -376,3 +420,50 @@ def test_evidence_gate_rejects_when_no_category_has_grounded_item(
         validate_parse_evidence(payload, redacted_text="无相关正文")
 
     assert error.value.code == "RESUME_EVIDENCE_EMPTY"
+
+
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "application/x-pdf",
+        "application/wps-office.pdf",
+        "binary/octet-stream",
+        "",
+    ],
+)
+def test_mobile_pdf_media_types_still_require_pdf_signature(media_type: str) -> None:
+    assert detect_resume_document("resume.pdf", media_type, b"%PDF-1.7") == "pdf"
+    with pytest.raises(APIError) as error:
+        detect_resume_document("resume.pdf", media_type, b"not-a-pdf")
+    assert error.value.code == "RESUME_FILE_TYPE_UNSUPPORTED"
+
+
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "application/wps-office.docx",
+        "application/zip",
+        "application/x-zip-compressed",
+        "application/msword",
+        "binary/octet-stream",
+        "",
+    ],
+)
+def test_mobile_docx_media_types_still_validate_docx_archive(media_type: str) -> None:
+    assert (
+        detect_resume_document("resume.docx", media_type, make_docx_bytes())
+        == "docx"
+    )
+    with pytest.raises(APIError) as error:
+        detect_resume_document("resume.docx", media_type, b"not-a-zip")
+    assert error.value.code == "RESUME_DOCUMENT_INVALID"
+
+
+def test_unrelated_html_media_type_is_rejected_even_with_valid_signature() -> None:
+    for filename, payload in (
+        ("resume.pdf", b"%PDF-1.7"),
+        ("resume.docx", make_docx_bytes()),
+    ):
+        with pytest.raises(APIError) as error:
+            detect_resume_document(filename, "text/html", payload)
+        assert error.value.code == "RESUME_FILE_TYPE_UNSUPPORTED"

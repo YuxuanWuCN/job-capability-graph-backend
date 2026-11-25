@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, DragEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { RadarChart, PolarGrid, PolarAngleAxis, Radar, ResponsiveContainer } from 'recharts'
@@ -7,6 +7,7 @@ import {
   ArrowRightOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
+  CloseOutlined,
   CloudUploadOutlined,
   CompassOutlined,
   FileSearchOutlined,
@@ -21,16 +22,22 @@ import {
   WarningOutlined,
 } from '@ant-design/icons'
 import { FrameCorners } from '../components/FrameCorners'
-import { GraphScene3D } from '../components/GraphScene3D'
+import { MobileGraph2DView } from '../components/MobileGraph2DView'
+import { useViewMode } from '../context/ViewModeContext'
 import AuthGate from '../components/AuthGate'
 import CapabilityTranslatorPanel from '../components/CapabilityTranslatorPanel'
 import ApplicantRecordsPanel from '../components/ApplicantRecordsPanel'
+
+const LazyGraphScene3D = lazy(() =>
+  import('../components/GraphScene3D').then((mod) => ({ default: mod.GraphScene3D })),
+)
 import { fetchGraphData } from '../services/graphApi'
 import {
   confirmResumeProfile,
   createGrowthPath,
   createJobRecommendations,
   createResume,
+  createResumeFromText,
   getGrowthPath,
   getProcessingRun,
   getProcessingRunResult,
@@ -41,6 +48,7 @@ import {
   type ProcessingRunResponse,
   type RecommendationCreateResponse,
   type RecommendationDetailResponse,
+  type ResumeCreateResponse,
   type ResumeProcessingResult,
   type ResumeProfileDetail,
   type ResumeSkillRecord,
@@ -284,15 +292,20 @@ function RocketLoader({ progress, stage }: { progress: number; stage: string | n
 
 function ApplicantFlowPageContent() {
   const navigate = useNavigate()
+  const { isMobile } = useViewMode()
   const [step, setStep] = useState<Step>(0)
   const [uploading, setUploading] = useState(false)
   const [uploadState, setUploadState] = useState<UploadState>('idle')
   const [progress, setProgress] = useState(0)
   const [drag, setDrag] = useState(false)
+  const [inputMode, setInputMode] = useState<'file' | 'text'>('file')
+  const [pastedText, setPastedText] = useState('')
+  const [pastedTitle, setPastedTitle] = useState('')
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [currentRun, setCurrentRun] = useState<ProcessingRunResponse | null>(null)
   const [resumeRunResult, setResumeRunResult] = useState<ResumeProcessingResult | null>(null)
   const [resumeProfile, setResumeProfile] = useState<ResumeProfileDetail | null>(null)
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null)
   const [workflowError, setWorkflowError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<ActiveTab>('radar')
   const [recommendationLoading, setRecommendationLoading] = useState(false)
@@ -325,6 +338,10 @@ function ApplicantFlowPageContent() {
   const selectedGrowthKey = recommendations && selectedJobRoleId ? `${recommendations.run.id}:${selectedJobRoleId}` : null
   const currentGrowthPath = growthPath && growthPathKey === selectedGrowthKey ? growthPath : null
   const selectedRadarData = useMemo(() => radarData(selectedResult), [selectedResult])
+  const selectedSkill = useMemo(
+    () => resumeProfile?.skills.find((item) => item.id === selectedSkillId) ?? null,
+    [resumeProfile, selectedSkillId],
+  )
   const matchedCapabilities = selectedMatchDetail?.matched_capabilities ?? []
   const missingCapabilities = selectedMatchDetail?.missing_capabilities ?? []
   const missingRequired = missingCapabilities.filter((item) => item.requirement_type === 'required')
@@ -436,6 +453,7 @@ function ApplicantFlowPageContent() {
     setCurrentRun(null)
     setResumeRunResult(null)
     setResumeProfile(null)
+    setSelectedSkillId(null)
     setRecommendations(null)
     setSelectedJobRoleId(null)
     setSelectedMatchDetail(null)
@@ -446,6 +464,38 @@ function ApplicantFlowPageContent() {
     setSelectedGraphStar(null)
     setSelectedGraphPlanet(null)
     setActiveTab('radar')
+  }
+
+  const pollAndLoadProfile = async (created: ResumeCreateResponse) => {
+    setUploadState('processing')
+    setProgress(10)
+
+    let latestRun: ProcessingRunResponse | null = null
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      latestRun = await getProcessingRun(created.run_id)
+      setCurrentRun(latestRun)
+      setProgress(clampPercent(latestRun.progress_percent))
+
+      if (latestRun.status === 'completed') {
+        const result = await getProcessingRunResult(created.run_id)
+        const profile = await getResumeProfile(created.resource_id, result.profile_version)
+        setResumeRunResult(result)
+        setResumeProfile(profile)
+        setUploadState('ready')
+        setProgress(100)
+        setHistoryRefreshKey((value) => value + 1)
+        setStep(1)
+        return
+      }
+
+      if (latestRun.status === 'failed' || latestRun.status === 'cancelled' || latestRun.status === 'enqueue_failed') {
+        throw new Error(latestRun.error_message || '简历解析失败')
+      }
+
+      await sleep(2_000)
+    }
+
+    throw new Error('简历解析超时，请稍后重试')
   }
 
   const startUpload = async (file: File) => {
@@ -467,35 +517,33 @@ function ApplicantFlowPageContent() {
       const created = await createResume(file, file.name, (uploadProgress) => {
         setProgress(Math.max(2, Math.min(30, Math.round(uploadProgress * 0.3))))
       })
-      setUploadState('processing')
-      setProgress(10)
+      await pollAndLoadProfile(created)
+    } catch (error) {
+      setUploadState('failed')
+      setWorkflowError(apiErrorMessage(error))
+    } finally {
+      setUploading(false)
+    }
+  }
 
-      let latestRun: ProcessingRunResponse | null = null
-      for (let attempt = 0; attempt < 120; attempt += 1) {
-        latestRun = await getProcessingRun(created.run_id)
-        setCurrentRun(latestRun)
-        setProgress(clampPercent(latestRun.progress_percent))
+  const startTextSubmit = async () => {
+    if (uploading) return
+    const trimmed = pastedText.trim()
+    if (trimmed.replace(/\s+/g, '').length < 20) {
+      setWorkflowError('请粘贴完整的简历内容（至少 20 个有效字）')
+      return
+    }
+    resetAnalysisState()
+    setStep(0)
+    setSelectedFile(null)
+    setUploading(true)
+    setUploadState('uploading')
+    setWorkflowError(null)
+    setProgress(5)
 
-        if (latestRun.status === 'completed') {
-          const result = await getProcessingRunResult(created.run_id)
-          const profile = await getResumeProfile(created.resource_id, result.profile_version)
-          setResumeRunResult(result)
-          setResumeProfile(profile)
-          setUploadState('ready')
-          setProgress(100)
-          setHistoryRefreshKey((value) => value + 1)
-          setStep(1)
-          return
-        }
-
-        if (latestRun.status === 'failed' || latestRun.status === 'cancelled' || latestRun.status === 'enqueue_failed') {
-          throw new Error(latestRun.error_message || '简历解析失败')
-        }
-
-        await sleep(2_000)
-      }
-
-      throw new Error('简历解析超时，请稍后重试')
+    try {
+      const created = await createResumeFromText(trimmed, pastedTitle)
+      await pollAndLoadProfile(created)
     } catch (error) {
       setUploadState('failed')
       setWorkflowError(apiErrorMessage(error))
@@ -589,6 +637,36 @@ function ApplicantFlowPageContent() {
           </div>
         </div>
 
+        <div className="mobile-step-bar" aria-label="评估进度">
+          <div className="mobile-step-bar__head">
+            <div>
+              <span>STEP 0{step + 1} / 04</span>
+              <strong>{APPLICANT_STEPS[step]}</strong>
+            </div>
+            {step > 0 && (
+              <button
+                type="button"
+                className="mobile-step-bar__back"
+                onClick={() => setStep((s) => Math.max(0, s - 1) as Step)}
+              >
+                <ArrowLeftOutlined /> 返回上一步
+              </button>
+            )}
+          </div>
+          <div className="mobile-step-bar__track">
+            {APPLICANT_STEPS.map((label, i) => (
+              <button
+                key={label}
+                type="button"
+                className={`mobile-step-bar__seg ${i < step ? 'is-done' : i === step ? 'is-active' : ''}`}
+                disabled={i >= step}
+                onClick={() => i < step && setStep(i as Step)}
+                aria-label={`步骤 ${i + 1}：${label}`}
+              />
+            ))}
+          </div>
+        </div>
+
         <div className="console-stepper archive-stepper mb-10">
           {APPLICANT_STEPS.map((label, i) => (
             <div key={label} className="console-stepper__item">
@@ -625,23 +703,116 @@ function ApplicantFlowPageContent() {
               style={{
                 border: drag ? '2px dashed #e4b592' : '2px dashed rgba(255,243,234,0.22)',
                 boxShadow: drag ? '0 0 40px rgba(228,181,146,0.1)' : 'none',
-                cursor: !uploading ? 'pointer' : 'default',
+                cursor: !uploading && inputMode === 'file' ? 'pointer' : 'default',
                 opacity: 1,
               }}
               onDragOver={(event) => {
                 event.preventDefault()
-                if (uploading) return
+                if (uploading || inputMode !== 'file') return
                 setDrag(true)
               }}
               onDragLeave={() => setDrag(false)}
-              onDrop={handleDrop}
+              onDrop={(event) => {
+                if (inputMode !== 'file') {
+                  event.preventDefault()
+                  setDrag(false)
+                  return
+                }
+                handleDrop(event)
+              }}
               onClick={() => {
-                if (!uploading) fileRef.current?.click()
+                if (!uploading && inputMode === 'file') fileRef.current?.click()
               }}
             >
               <FrameCorners />
+              {!uploading && (
+                <div
+                  className="applicant-mode-switch"
+                  role="tablist"
+                  aria-label="简历提交方式"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={inputMode === 'file'}
+                    className={inputMode === 'file' ? 'is-active' : ''}
+                    onClick={() => {
+                      setInputMode('file')
+                      setWorkflowError(null)
+                    }}
+                  >
+                    上传文件（PDF / DOCX）
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={inputMode === 'text'}
+                    className={inputMode === 'text' ? 'is-active' : ''}
+                    onClick={() => {
+                      setInputMode('text')
+                      setDrag(false)
+                      setWorkflowError(null)
+                    }}
+                  >
+                    粘贴简历文字
+                  </button>
+                </div>
+              )}
               {uploading ? (
                 <RocketLoader progress={progress} stage={currentRun?.current_stage ?? 'upload'} />
+              ) : inputMode === 'text' ? (
+                <div className="applicant-text-form" onClick={(event) => event.stopPropagation()}>
+                  <div className="applicant-text-form__head">
+                    <strong>粘贴简历文字（免文件提取兜底）</strong>
+                    <span>{pastedText.trim().length} 字</span>
+                  </div>
+                  <input
+                    type="text"
+                    className="applicant-text-form__title"
+                    value={pastedTitle}
+                    onChange={(event) => setPastedTitle(event.target.value)}
+                    maxLength={200}
+                    placeholder="简历名称（可选，如：张三-前端开发简历）"
+                  />
+                  <textarea
+                    className="applicant-text-form__area"
+                    rows={9}
+                    value={pastedText}
+                    onChange={(event) => setPastedText(event.target.value)}
+                    placeholder="请直接从 Word / WPS / PDF 中全选复制简历文字并粘贴到此处（含教育背景、项目/实习经历、掌握技能等），系统将直接结构化解析..."
+                  />
+                  {workflowError && (
+                    <div className="mt-2 border border-[rgba(238,18,18,0.45)] bg-[rgba(238,18,18,0.06)] px-3 py-2 text-left text-[12px] text-[#ee1212]">
+                      <div className="flex items-center gap-2 font-semibold">
+                        <WarningOutlined />
+                        {workflowError}
+                      </div>
+                    </div>
+                  )}
+                  <div className="mt-3 flex gap-3 justify-center flex-wrap">
+                    <button
+                      type="button"
+                      className="btn btn-md btn-primary"
+                      onClick={() => void startTextSubmit()}
+                    >
+                      <RocketOutlined />
+                      开始 AI 解析
+                    </button>
+                    {pastedText && (
+                      <button
+                        type="button"
+                        className="btn btn-md btn-ghost"
+                        onClick={() => {
+                          setPastedText('')
+                          setWorkflowError(null)
+                        }}
+                      >
+                        清空内容
+                      </button>
+                    )}
+                  </div>
+                </div>
               ) : (
                 <>
                   <div className="dropzone-icon animate-float">
@@ -651,9 +822,9 @@ function ApplicantFlowPageContent() {
                     {selectedFile ? selectedFile.name : '上传候选人简历'}
                   </div>
                   <div className="text-[13px] text-[var(--text-dim)] mb-1.5">
-                    拖拽文件或点击选择，文件将保存到当前账号的个人档案
+                    点击选择或拖拽文件，将保存到当前会话档案
                   </div>
-                  <div className="text-[11px] text-[#a49b92]">支持 PDF / Word (.docx) · 最大 20 MB</div>
+                  <div className="text-[11px] text-[#a49b92]">支持 PDF / Word (.docx)，含文本框模板与扫描件自动 OCR · 最大 20 MB，30 页内</div>
                   {workflowError && (
                     <div className="mt-5 mx-auto max-w-md border border-[rgba(238,18,18,0.45)] bg-[rgba(238,18,18,0.06)] px-3 py-2 text-left text-[12px] text-[#ee1212]">
                       <div className="flex items-center gap-2 font-semibold">
@@ -665,6 +836,19 @@ function ApplicantFlowPageContent() {
                           ERROR / {currentRun.error_code}
                         </div>
                       )}
+                      <button
+                        type="button"
+                        className="mt-2 inline-flex items-center gap-1 text-[12px] text-[#e4b592] underline underline-offset-4 bg-transparent border-0 p-0 cursor-pointer"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setInputMode('text')
+                          setWorkflowError(null)
+                          setCurrentRun(null)
+                          setUploadState('idle')
+                        }}
+                      >
+                        识别失败？点此改用「粘贴简历文字」
+                      </button>
                     </div>
                   )}
                   <div className="mt-7 flex gap-3 justify-center">
@@ -696,7 +880,13 @@ function ApplicantFlowPageContent() {
                 </>
               )}
             </div>
-            <input ref={fileRef} type="file" className="hidden" accept=".pdf,.docx" onChange={handleFileSelect} />
+            <input
+              ref={fileRef}
+              type="file"
+              className="hidden"
+              accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              onChange={handleFileSelect}
+            />
             <aside className="applicant-scan-rail archive-panel glass">
               <FrameCorners />
               <div className="applicant-scan-rail__eyebrow">Real backend / async run</div>
@@ -761,25 +951,59 @@ function ApplicantFlowPageContent() {
                 </span>
               </div>
               {resumeProfile.skills.length ? (
-                <div className="flex flex-wrap gap-2">
-                  {resumeProfile.skills.map((skill, i) => {
-                    const mapped = skill.mapping_status === 'mapped'
-                    return (
-                      <div key={skill.id} className="tip-host animate-fade-up" style={{ animationDelay: `${i * 42}ms` }}>
-                        <span className={`tag ${mapped ? 'tag-blue' : 'tag-purple'}`} style={{ gap: 5 }}>
-                          {mapped ? '✦' : '○'} {skillName(skill)}
-                        </span>
-                        <span className="badge-conf ml-1">{toPercent(skill.confidence)}%</span>
-                        <div className="tip-box">
-                          <div className="font-bold text-[#e4b592] mb-1">置信度 {toPercent(skill.confidence)}%</div>
-                          <div className="text-xs">熟练度：{proficiencyLabel(skill.proficiency)}</div>
-                          <div className="text-xs">证据：{evidenceLabel(skill.evidence_strength)}</div>
-                          {skill.evidence_quote && <div className="text-xs mt-1 text-[var(--text-dim)]">{skill.evidence_quote}</div>}
+                <>
+                  <div className="flex flex-wrap gap-2">
+                    {resumeProfile.skills.map((skill, i) => {
+                      const mapped = skill.mapping_status === 'mapped'
+                      const selected = selectedSkillId === skill.id
+                      return (
+                        <button
+                          type="button"
+                          key={skill.id}
+                          className={`tip-host applicant-skill-chip animate-fade-up ${selected ? 'is-selected' : ''}`}
+                          style={{ animationDelay: `${i * 42}ms` }}
+                          onClick={() => setSelectedSkillId((cur) => (cur === skill.id ? null : skill.id))}
+                        >
+                          <span className={`tag ${mapped ? 'tag-blue' : 'tag-purple'}`} style={{ gap: 5 }}>
+                            {mapped ? '✦' : '○'} {skillName(skill)}
+                          </span>
+                          <span className="badge-conf ml-1">{toPercent(skill.confidence)}%</span>
+                          <div className="tip-box">
+                            <div className="font-bold text-[#e4b592] mb-1">置信度 {toPercent(skill.confidence)}%</div>
+                            <div className="text-xs">熟练度：{proficiencyLabel(skill.proficiency)}</div>
+                            <div className="text-xs">证据：{evidenceLabel(skill.evidence_strength)}</div>
+                            {skill.evidence_quote && <div className="text-xs mt-1 text-[var(--text-dim)]">{skill.evidence_quote}</div>}
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                  {selectedSkill && (
+                    <div className="applicant-skill-inspector" role="region" aria-label="技能证据详情">
+                      <div className="applicant-skill-inspector__head">
+                        <div>
+                          <span>SKILL EVIDENCE</span>
+                          <strong>{skillName(selectedSkill)}</strong>
                         </div>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedSkillId(null)}
+                          aria-label="收起技能详情"
+                        >
+                          <CloseOutlined />
+                        </button>
                       </div>
-                    )
-                  })}
-                </div>
+                      <div className="applicant-skill-inspector__meta">
+                        <span>置信度 {toPercent(selectedSkill.confidence)}%</span>
+                        <span>熟练度：{proficiencyLabel(selectedSkill.proficiency)}</span>
+                        <span>证据：{evidenceLabel(selectedSkill.evidence_strength)}</span>
+                      </div>
+                      {selectedSkill.evidence_quote && (
+                        <p className="applicant-skill-inspector__quote">“{selectedSkill.evidence_quote}”</p>
+                      )}
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="text-[13px] text-[var(--text-dim)]">后端没有返回可确认技能。</div>
               )}
@@ -861,7 +1085,7 @@ function ApplicantFlowPageContent() {
                 确认画像 <ArrowRightOutlined /> 生成岗位推荐
               </button>
             </div>
-            <div className="col-span-2">
+            <div className="applicant-span-full col-span-2">
               <CapabilityTranslatorPanel
                 skills={resumeProfile.skills}
                 major={typeof educations[0]?.major === 'string' ? educations[0].major : null}
@@ -872,6 +1096,26 @@ function ApplicantFlowPageContent() {
 
         {step === 2 && recommendations && (
           <div className="applicant-match-panel animate-fade-up">
+            <div className="mobile-job-strip" aria-label="推荐岗位快速切换">
+              {recommendations.results.items.map((job) => {
+                const active = job.job_role_id === selectedJobRoleId
+                return (
+                  <button
+                    key={job.job_role_id}
+                    type="button"
+                    className={`mobile-job-strip__pill ${active ? 'is-active' : ''}`}
+                    onClick={() => {
+                      setSelectedJobRoleId(job.job_role_id)
+                      setActiveTab((tab) => (tab === 'path' ? 'radar' : tab))
+                    }}
+                  >
+                    <span>{job.job_role.canonical_name}</span>
+                    <em>{Math.round(job.total_score)}分</em>
+                  </button>
+                )
+              })}
+            </div>
+
             <div className="applicant-tabs flex gap-1 mb-5">
               {(['radar', 'skills', 'graph', 'path'] as const).map((tab) => (
                 <button
@@ -914,7 +1158,7 @@ function ApplicantFlowPageContent() {
                       {selectedResult ? `与 ${selectedResult.job_role.canonical_name} 对比` : '等待选择岗位'}
                     </div>
                     <ResponsiveContainer width="100%" height={260}>
-                      <RadarChart data={selectedRadarData}>
+                      <RadarChart data={selectedRadarData} outerRadius="66%" margin={{ top: 8, right: 24, bottom: 8, left: 24 }}>
                         <PolarGrid stroke="rgba(255,243,234,0.18)" />
                         <PolarAngleAxis dataKey="axis" tick={{ fill: '#a49b92', fontSize: 11, fontFamily: 'IBM Plex Mono' }} />
                         <Radar dataKey="score" stroke="#e4b592" fill="#e4b592" fillOpacity={0.12} strokeWidth={2} dot={{ fill: '#e4b592', r: 3 }} />
@@ -996,57 +1240,113 @@ function ApplicantFlowPageContent() {
                       </button>
                     </div>
 
-                    <div className="applicant-role-graph__canvas graph-canvas-frame graph-canvas-frame--archive relative overflow-hidden">
-                      <FrameCorners />
-                      {jobGraphLoading && (
-                        <div className="applicant-role-graph__state">
-                          <div className="loading-reticle" />
-                          <strong>正在读取岗位图谱</strong>
-                          <span>加载本地 JD 星图并匹配当前推荐岗位</span>
-                        </div>
-                      )}
+                    {isMobile ? (
+                      <div className="applicant-role-graph__mobile-box">
+                        {jobGraphLoading && (
+                          <div className="applicant-role-graph__state">
+                            <div className="loading-reticle" />
+                            <strong>正在读取岗位图谱</strong>
+                            <span>加载本地 JD 星图并匹配当前推荐岗位</span>
+                          </div>
+                        )}
 
-                      {!jobGraphLoading && jobGraphError && (
-                        <div className="applicant-role-graph__state applicant-role-graph__state--error">
-                          <WarningOutlined />
-                          <strong>岗位图谱暂不可用</strong>
-                          <span>{jobGraphError}</span>
-                        </div>
-                      )}
+                        {!jobGraphLoading && jobGraphError && (
+                          <div className="applicant-role-graph__state applicant-role-graph__state--error">
+                            <WarningOutlined />
+                            <strong>岗位图谱暂不可用</strong>
+                            <span>{jobGraphError}</span>
+                          </div>
+                        )}
 
-                      {!jobGraphLoading && !jobGraphError && !selectedJobGraphData && (
-                        <div className="applicant-role-graph__state">
-                          <FundProjectionScreenOutlined />
-                          <strong>未匹配到图谱节点</strong>
-                          <span>当前推荐岗位未能和 JD 星图中的岗位节点对齐，可打开完整星图手动搜索。</span>
-                        </div>
-                      )}
+                        {!jobGraphLoading && !jobGraphError && !selectedJobGraphData && (
+                          <div className="applicant-role-graph__state">
+                            <FundProjectionScreenOutlined />
+                            <strong>未匹配到图谱节点</strong>
+                            <span>当前推荐岗位未能和 JD 星图中的岗位节点对齐，可打开完整星图手动搜索。</span>
+                          </div>
+                        )}
 
-                      {!jobGraphLoading && !jobGraphError && selectedJobGraphData && (
-                        <>
-                          <GraphScene3D
-                            data={selectedJobGraphData}
-                            selectedStar={selectedGraphStar}
+                        {!jobGraphLoading && !jobGraphError && selectedJobGraphData && (
+                          <MobileGraph2DView
+                            mode="embedded"
+                            stars={selectedJobGraphData.stars}
+                            planets={selectedJobGraphData.planets}
+                            activeStar={selectedGraphStar ?? selectedJobGraphData.stars[0] ?? null}
                             selectedPlanet={selectedGraphPlanet}
-                            onStarClick={(star) => {
+                            matchedSkillNames={matchedCapabilities.map((item) => item.canonical_name)}
+                            onSelectStar={(star) => {
                               setSelectedGraphStar(star)
                               setSelectedGraphPlanet(null)
                             }}
-                            onPlanetClick={(planet) => {
-                              setSelectedGraphPlanet(planet)
-                              setSelectedGraphStar(null)
+                            onSelectPlanet={(planet) => {
+                              setSelectedGraphPlanet((prev) => (prev?.id === planet.id ? null : planet))
                             }}
-                            showJobLabels
-                            showSkillLabels
-                            filterTypes={['core', 'foundation', 'frontier']}
+                            onOpenFullGraph={() => navigate(selectedRoleGraphPath)}
                           />
-                          <div className="applicant-role-graph__readout archive-panel glass">
-                            <span>FOCUS</span>
-                            <strong>{graphFocusLabel}</strong>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="applicant-role-graph__canvas graph-canvas-frame graph-canvas-frame--archive relative overflow-hidden">
+                        <FrameCorners />
+                        {jobGraphLoading && (
+                          <div className="applicant-role-graph__state">
+                            <div className="loading-reticle" />
+                            <strong>正在读取岗位图谱</strong>
+                            <span>加载本地 JD 星图并匹配当前推荐岗位</span>
                           </div>
-                        </>
-                      )}
-                    </div>
+                        )}
+
+                        {!jobGraphLoading && jobGraphError && (
+                          <div className="applicant-role-graph__state applicant-role-graph__state--error">
+                            <WarningOutlined />
+                            <strong>岗位图谱暂不可用</strong>
+                            <span>{jobGraphError}</span>
+                          </div>
+                        )}
+
+                        {!jobGraphLoading && !jobGraphError && !selectedJobGraphData && (
+                          <div className="applicant-role-graph__state">
+                            <FundProjectionScreenOutlined />
+                            <strong>未匹配到图谱节点</strong>
+                            <span>当前推荐岗位未能和 JD 星图中的岗位节点对齐，可打开完整星图手动搜索。</span>
+                          </div>
+                        )}
+
+                        {!jobGraphLoading && !jobGraphError && selectedJobGraphData && (
+                          <>
+                            <Suspense
+                              fallback={(
+                                <div className="applicant-role-graph__state">
+                                  <div className="loading-reticle" />
+                                  <strong>正在加载 3D 星图组件</strong>
+                                </div>
+                              )}
+                            >
+                              <LazyGraphScene3D
+                                data={selectedJobGraphData}
+                                selectedStar={selectedGraphStar}
+                                selectedPlanet={selectedGraphPlanet}
+                                onStarClick={(star) => {
+                                  setSelectedGraphStar(star)
+                                  setSelectedGraphPlanet(null)
+                                }}
+                                onPlanetClick={(planet) => {
+                                  setSelectedGraphPlanet(planet)
+                                  setSelectedGraphStar(null)
+                                }}
+                                showJobLabels
+                                showSkillLabels
+                                filterTypes={['core', 'foundation', 'frontier']}
+                              />
+                            </Suspense>
+                            <div className="applicant-role-graph__readout archive-panel glass">
+                              <span>FOCUS</span>
+                              <strong>{graphFocusLabel}</strong>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
 
                     <div className="applicant-role-graph__summary">
                       <div>
@@ -1226,7 +1526,7 @@ function ApplicantFlowPageContent() {
                 </div>
               </>
             ) : (
-              <div className="archive-panel glass rounded-2xl p-6 col-span-2">
+              <div className="archive-panel glass rounded-2xl p-6 applicant-span-full col-span-2">
                 <FrameCorners />
                 <div className="font-outfit font-bold text-[18px] text-[var(--text)] mb-2">成长路径尚未生成</div>
                 <p className="text-[13px] text-[var(--text-dim)] mb-4">

@@ -76,3 +76,24 @@ class ResponsesClient:
             request_id=str(processing_run_id),
             reasoning_effort="low",
         )
+
+    async def ocr_resume_images(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        model: str,
+        images: list[tuple[str, bytes]],
+        processing_run_id: UUID,
+    ) -> str:
+        return await self.client.ocr_images(
+            url=url,
+            api_key=api_key,
+            model=model,
+            images=images,
+            metadata={
+                "operation": "ocr_resume",
+                "processing_run_id": str(processing_run_id),
+            },
+            request_id=str(processing_run_id),
+        )

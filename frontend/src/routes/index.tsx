@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-route
 import DynamicSkillBackground from '../components/DynamicSkillBackground'
 import ArchiveReturnHome from '../components/ArchiveReturnHome'
 import SessionDock from '../components/SessionDock'
+import MobileAppChrome from '../components/MobileAppChrome'
 
 const SpaceHomePage = lazy(() => import('../pages/SpaceHomePage'))
 const SpaceGraphPage = lazy(() => import('../pages/SpaceGraphPage'))
@@ -11,6 +12,7 @@ const HRWorkspacePage = lazy(() => import('../pages/HRWorkspacePage'))
 const EmergingJobsPage = lazy(() => import('../pages/EmergingJobsPage'))
 const ReviewCenterPage = lazy(() => import('../pages/ReviewCenterPage'))
 const AdminCenterPage = lazy(() => import('../pages/AdminCenterPage'))
+const RegisterPage = lazy(() => import('../pages/RegisterPage'))
 
 function RouteFallback() {
   return <div className="route-fallback" aria-label="正在加载页面"><span /><span /><span /></div>
@@ -24,6 +26,7 @@ const RoutedApp = () => {
       <DynamicSkillBackground />
       {!isArchiveHome && <ArchiveReturnHome />}
       <SessionDock />
+      <MobileAppChrome />
       <main className="app-content">
         <Suspense fallback={<RouteFallback />}>
           <Routes>
@@ -37,6 +40,7 @@ const RoutedApp = () => {
             <Route path="/new-jobs" element={<EmergingJobsPage />} />
             <Route path="/review" element={<ReviewCenterPage />} />
             <Route path="/admin" element={<AdminCenterPage />} />
+            <Route path="/register" element={<RegisterPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>

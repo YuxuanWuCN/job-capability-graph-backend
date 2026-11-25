@@ -304,7 +304,9 @@ export default function ApplicantRecordsPanel({ refreshKey, onOpenProfile, onOpe
       )}
 
       <Modal
+        className="responsive-modal"
         width={920}
+        styles={{ body: { maxHeight: '72dvh', overflowY: 'auto' } }}
         title={editorProfile ? `修订画像 V${editorProfile.version_no}` : '修订画像'}
         open={Boolean(editorProfile)}
         confirmLoading={working}

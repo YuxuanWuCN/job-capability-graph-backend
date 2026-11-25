@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query, Request
 
 from app.api.dependencies import CSRF, DB, Admin, Identity
+from app.graph.cache import get_cached, set_cached
 from app.graph.query import get_global_graph, get_job_role_graph
 from app.graph.schemas import GraphVersionCreate
 from app.graph.service import (
@@ -24,16 +25,23 @@ async def global_graph(
     db: DB,
     identity: Identity,
     domain_id: Annotated[UUID | None, Query()] = None,
-    max_job_roles: int = Query(default=30, ge=1, le=50),
-    max_capabilities: int = Query(default=120, ge=1, le=200),
+    max_job_roles: int = Query(default=200, ge=1, le=500),
+    max_capabilities: int = Query(default=200, ge=1, le=200),
 ) -> dict:
+    # 这份数据全站一致，参数组合只有个位数：5 秒内复用，峰值并发只查一次 Neo4j。
+    cache_key = ("global_graph", str(domain_id), max_job_roles, max_capabilities)
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
     value = await get_global_graph(
         db,
         domain_id=domain_id,
         max_job_roles=max_job_roles,
         max_capabilities=max_capabilities,
     )
-    return {"data": value.model_dump(mode="json")}
+    payload = {"data": value.model_dump(mode="json")}
+    set_cached(cache_key, payload)
+    return payload
 
 
 @read_router.get("/emerging-jobs")

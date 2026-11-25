@@ -16,6 +16,7 @@ interface AuthContextValue {
   sessionError: string | null;
   ensureSession: () => Promise<AuthUser | null>;
   login: (username: string, password: string) => Promise<void>;
+  loginAsGuest: () => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -27,6 +28,20 @@ async function fetchMe(): Promise<AuthUser | null> {
   });
   if (res.status === 401) return null;
   if (!res.ok) throw new Error('无法读取登录状态');
+  const body = await res.json();
+  return (body.data ?? body) as AuthUser;
+}
+
+/**
+ * 游客模式：由用户在登录页显式点击「以游客身份进入」时才签发，
+ * 不再自动登录，避免一进站就被当成游客、也避免挡住管理员登录。
+ */
+async function createGuestSession(): Promise<AuthUser | null> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/auth/guest`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+  if (!res.ok) return null;
   const body = await res.json();
   return (body.data ?? body) as AuthUser;
 }
@@ -47,8 +62,12 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       setSessionError(null);
       try {
         const current = await fetchMe();
-        setUser(current);
-        return current;
+        if (current) {
+          setUser(current);
+          return current;
+        }
+        setUser(null);
+        return null;
       } catch {
         setUser(null);
         setSessionError('无法连接后端服务，请检查 API 是否已启动');
@@ -92,6 +111,13 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setSessionError(null);
   };
 
+  const loginAsGuest = async () => {
+    const guest = await createGuestSession();
+    if (!guest) throw new Error('游客登录失败，请稍后重试');
+    setUser(guest);
+    setSessionError(null);
+  };
+
   const logout = async () => {
     const csrf = document.cookie.match(/(?:^|; )csrf=([^;]*)/)?.[1];
     await fetch(`${API_BASE_URL}/api/v1/auth/logout`, {
@@ -104,7 +130,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, sessionError, ensureSession, login, logout }}>
+    <AuthContext.Provider
+      value={{ user, loading, sessionError, ensureSession, login, loginAsGuest, logout }}
+    >
       {children}
     </AuthContext.Provider>
   );

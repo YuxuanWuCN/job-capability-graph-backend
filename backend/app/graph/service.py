@@ -20,6 +20,7 @@ from app.catalog.models import (
 )
 from app.core.errors import APIError
 from app.discovery.models import CombinationSkill, SkillCombinationCandidate
+from app.graph.cache import invalidate_graph_cache
 from app.graph.models import GraphVersion
 from app.graph.neo4j import (
     GraphPublishResult,
@@ -345,6 +346,8 @@ async def publish_graph_version(
     if published is None:
         raise APIError(404, "GRAPH_VERSION_NOT_FOUND", "图谱版本不存在")
     await db.refresh(published)
+    # 新版本已生效：立刻让读接口的短缓存失效，避免最多 5 秒的旧图谱。
+    invalidate_graph_cache()
     return published
 
 

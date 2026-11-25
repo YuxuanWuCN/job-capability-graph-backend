@@ -323,6 +323,16 @@ export async function createResume(
   })
 }
 
+export async function createResumeFromText(
+  text: string,
+  displayName?: string,
+): Promise<ResumeCreateResponse> {
+  return request.post<ResumeCreateResponse>('/api/v1/resumes/text', {
+    text,
+    display_name: displayName?.trim() || null,
+  })
+}
+
 export async function getProcessingRun(runId: string): Promise<ProcessingRunResponse> {
   return request.get<ProcessingRunResponse>(`/api/v1/processing-runs/${runId}`)
 }

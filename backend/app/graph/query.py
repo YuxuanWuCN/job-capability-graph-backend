@@ -326,16 +326,12 @@ def _normalize_graph(
             requirement_type = str(record["requirement_type"])
             if requirement_type not in {"REQUIRES", "BONUS"}:
                 raise _projection_inconsistent()
-            requirement_edge_id = _relation_id(
-                record["requirement_relation_key"]
-            )
+            requirement_edge_id = _relation_id(record["requirement_relation_key"])
             edges.setdefault(
                 requirement_edge_id,
                 GraphEdge(
                     id=requirement_edge_id,
-                    type=(
-                        "requires" if requirement_type == "REQUIRES" else "bonus"
-                    ),
+                    type=("requires" if requirement_type == "REQUIRES" else "bonus"),
                     source=role_id,
                     target=capability.id,
                     properties={"importance": float(record["importance"])},

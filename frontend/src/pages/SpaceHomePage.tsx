@@ -2,11 +2,12 @@ import { useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { NodeIndexOutlined } from '@ant-design/icons'
-import moonImage from '../assets/apollo-moon.jpg'
-import graphImage from '../assets/archive-graph.png'
-import resumeImage from '../assets/archive-resume.png'
-import hiringImage from '../assets/archive-hiring.png'
-import trendsImage from '../assets/archive-trends.png'
+import { useViewMode } from '../context/ViewModeContext'
+import moonImage from '../assets/apollo-moon.webp'
+import graphImage from '../assets/archive-graph.webp'
+import resumeImage from '../assets/archive-resume.webp'
+import hiringImage from '../assets/archive-hiring.webp'
+import trendsImage from '../assets/archive-trends.webp'
 
 type ArchiveAction = {
   id: string
@@ -52,7 +53,7 @@ const ARCHIVE_ACTIONS: ArchiveAction[] = [
   },
 ]
 
-function Starfield() {
+function Starfield({ isMobile }: { isMobile: boolean }) {
   const stars = useRef(
     Array.from({ length: 170 }, (_, index) => ({
       x: (Math.sin(index * 19.37) * 10000) % 100,
@@ -63,10 +64,11 @@ function Starfield() {
       del: (index % 13) * 0.18,
     }))
   )
+  const visibleStars = isMobile ? stars.current.slice(0, 45) : stars.current
 
   return (
     <div className="absolute inset-0 overflow-hidden pointer-events-none">
-      {stars.current.map((s, i) => (
+      {visibleStars.map((s, i) => (
         <span
           key={i}
           className="absolute bg-[#fff3ea] animate-twinkle"
@@ -87,11 +89,13 @@ function Starfield() {
 
 export default function SpaceHomePage() {
   const navigate = useNavigate()
+  const { isMobile } = useViewMode()
   const archiveRef = useRef<HTMLElement>(null)
   const [activeActionId, setActiveActionId] = useState(ARCHIVE_ACTIONS[0].id)
   const activeAction = ARCHIVE_ACTIONS.find((action) => action.id === activeActionId) ?? ARCHIVE_ACTIONS[0]
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    if (isMobile || event.pointerType === 'touch') return
     const rect = event.currentTarget.getBoundingClientRect()
     const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
     const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
@@ -138,7 +142,7 @@ export default function SpaceHomePage() {
 
   return (
     <div className="space-home min-h-screen relative overflow-hidden">
-      <Starfield />
+      <Starfield isMobile={isMobile} />
       <div className="space-home__grid" />
 
       <section
@@ -173,6 +177,25 @@ export default function SpaceHomePage() {
             <span>FIELD STUDY</span>
             <span>40.7128 N / 74.0060 W</span>
           </div>
+          <div className="moon-archive__mobile-cta">
+            <p>上传 PDF / DOCX 简历，生成个人能力画像、岗位推荐与成长路径。</p>
+            <div className="moon-archive__mobile-actions">
+              <button
+                type="button"
+                className="btn btn-md btn-primary"
+                onClick={() => navigate('/applicant')}
+              >
+                立即评估简历
+              </button>
+              <button
+                type="button"
+                className="btn btn-md btn-ghost"
+                onClick={() => navigate('/graph')}
+              >
+                探索能力星图
+              </button>
+            </div>
+          </div>
         </div>
 
         <div className="moon-stage" aria-hidden={false}>
@@ -182,7 +205,7 @@ export default function SpaceHomePage() {
             onClick={() => openArchive(activeAction)}
             aria-label={`打开${activeAction.title}`}
           >
-            <img src={moonImage} alt="月球表面档案主视觉" />
+            <img src={moonImage} alt="月球表面档案主视觉" fetchPriority="high" decoding="async" />
             <span className="moon-stage__moon-target">
               <span>ACTIVE TARGET</span>
               <strong>{activeAction.title}</strong>
@@ -207,12 +230,12 @@ export default function SpaceHomePage() {
               aria-label={`打开${action.title}`}
             >
               <span className="archive-photo__frame">
-                <img src={action.image} alt="" />
+                <img src={action.image} alt="" loading="lazy" decoding="async" />
               </span>
               <span className="archive-photo__meta">
                 {action.meta}
               </span>
-              <strong>{action.title}</strong>
+              <strong>{action.id === 'graph' && isMobile ? '岗位能力星图' : action.title}</strong>
               <em>{action.coord}</em>
               <span className="archive-photo__cue">ENTER ARCHIVE</span>
             </button>

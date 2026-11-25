@@ -4,12 +4,13 @@ from uuid import UUID
 from fastapi import APIRouter, File, Form, Header, Query, Request, UploadFile
 
 from app.api.dependencies import CSRF, DB, Identity
-from app.resumes.schemas import ManualProfileReplaceRequest
+from app.resumes.schemas import ManualProfileReplaceRequest, ResumeTextCreateRequest
 from app.resumes.service import (
     archive_resume,
     confirm_profile,
     create_manual_revision,
     create_resume,
+    create_resume_from_text,
     extracted_text,
     get_visible_resume,
     list_profiles,
@@ -62,6 +63,31 @@ async def create(
         actor,
         file,
         display_name=display_name,
+        idempotency_key=idempotency_key,
+        request_id=request.state.request_id,
+        ip_address=request.client.host if request.client else None,
+    )
+    return {"data": value.model_dump(mode="json")}
+
+
+@router.post("/text", status_code=202)
+async def create_from_text(
+    payload: ResumeTextCreateRequest,
+    request: Request,
+    db: DB,
+    identity: Identity,
+    _csrf: CSRF,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ] = None,
+) -> dict:
+    actor, _ = identity
+    value = await create_resume_from_text(
+        db,
+        actor,
+        text=payload.text,
+        display_name=payload.display_name,
         idempotency_key=idempotency_key,
         request_id=request.state.request_id,
         ip_address=request.client.host if request.client else None,

@@ -1,0 +1,16 @@
+[Unit]
+Description=Job Graph warm-up (preheat health, session, graph endpoints)
+After=docker.service nginx.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/job-graph/deploy/warmup.sh
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=no
+# 开机时容器重建需要时间，脚本内部会轮询 /health/ready，这里只兜底超时
+TimeoutStartSec=360
+
+[Install]
+WantedBy=multi-user.target

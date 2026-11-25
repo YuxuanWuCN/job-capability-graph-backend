@@ -1,3 +1,4 @@
+import secrets
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -5,24 +6,63 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit.models import AuditLog
 from app.audit.service import record_audit
 from app.auth.models import AuthSession, LoginAttempt, User
 from app.auth.schemas import (
     PasswordResetRequest,
+    RegisterRequest,
     UserCreateRequest,
     UserUpdateRequest,
 )
 from app.core.config import get_settings
 from app.core.errors import APIError
-from app.core.security import hash_password, new_token, token_digest, verify_password
+from app.core.security import (
+    constant_time_equal,
+    hash_password,
+    new_token,
+    token_digest,
+    verify_password,
+)
 
 LOGIN_WINDOW = timedelta(minutes=10)
 LOGIN_FAILURE_LIMIT = 10
 LAST_SEEN_INTERVAL = timedelta(minutes=5)
+REGISTRATION_WINDOW = timedelta(minutes=10)
+REGISTRATION_DENIAL_LIMIT = 30
+GUEST_WINDOW = timedelta(hours=1)
+GUEST_CREATE_LIMIT = 300
+GUEST_DISPLAY_NAME = "游客"
 
 
 def normalize_username(username: str) -> str:
     return username.strip().lower()
+
+
+def _issue_session(
+    db: AsyncSession,
+    user: User,
+    now: datetime,
+    ip_address: str | None,
+    user_agent: str | None,
+) -> tuple[str, str]:
+    settings = get_settings()
+    secret = settings.session_secret.get_secret_value()
+    session_token = new_token()
+    csrf_token = new_token()
+    db.add(
+        AuthSession(
+            user_id=user.id,
+            token_hash=token_digest(session_token, secret),
+            csrf_token_hash=token_digest(csrf_token, secret),
+            expires_at=now + timedelta(seconds=settings.session_ttl_seconds),
+            last_seen_at=now,
+            ip_address=ip_address,
+            user_agent=user_agent[:500] if user_agent else None,
+        )
+    )
+    user.last_login_at = now
+    return session_token, csrf_token
 
 
 async def login(
@@ -96,26 +136,13 @@ async def login(
             raise APIError(429, "LOGIN_RATE_LIMITED", "登录失败次数过多，请稍后再试")
         raise APIError(401, "INVALID_CREDENTIALS", "用户名或密码错误")
 
-    settings = get_settings()
-    session_token = new_token()
-    csrf_token = new_token()
-    auth_session = AuthSession(
-        user_id=user.id,
-        token_hash=token_digest(
-            session_token,
-            settings.session_secret.get_secret_value(),
-        ),
-        csrf_token_hash=token_digest(
-            csrf_token,
-            settings.session_secret.get_secret_value(),
-        ),
-        expires_at=now + timedelta(seconds=settings.session_ttl_seconds),
-        last_seen_at=now,
-        ip_address=ip_address,
-        user_agent=user_agent[:500] if user_agent else None,
+    session_token, csrf_token = _issue_session(
+        db,
+        user,
+        now,
+        ip_address,
+        user_agent,
     )
-    user.last_login_at = now
-    db.add(auth_session)
     _record_login_attempt(
         db,
         normalized,
@@ -211,6 +238,176 @@ async def revoke_all_sessions(
         ip_address=ip_address,
     )
     await db.commit()
+
+
+async def register_applicant(
+    db: AsyncSession,
+    payload: RegisterRequest,
+    *,
+    request_id: str,
+    ip_address: str | None,
+    user_agent: str | None,
+) -> tuple[User, str, str]:
+    settings = get_settings()
+    if not settings.registration_enabled:
+        raise APIError(403, "REGISTRATION_DISABLED", "当前未开放学生注册")
+
+    now = datetime.now(UTC)
+    if ip_address is not None and (
+        await _recent_registration_denials(db, ip_address, now)
+        >= REGISTRATION_DENIAL_LIMIT
+    ):
+        raise APIError(429, "REGISTRATION_RATE_LIMITED", "失败次数过多，请稍后再试")
+
+    invite = settings.registration_invite_code
+    expected_code = invite.get_secret_value().strip() if invite is not None else ""
+    if not constant_time_equal(payload.invite_code.strip(), expected_code):
+        record_audit(
+            db,
+            action="auth.register",
+            resource_type="user",
+            resource_id=None,
+            actor_user_id=None,
+            outcome="denied",
+            request_id=request_id,
+            ip_address=ip_address,
+            metadata={"reason": "invalid_invite_code"},
+        )
+        await db.commit()
+        raise APIError(403, "INVITE_CODE_INVALID", "邀请码不正确")
+
+    username = payload.username.strip()
+    normalized = normalize_username(username)
+    if await db.scalar(select(User.id).where(User.username_normalized == normalized)):
+        raise APIError(409, "USERNAME_ALREADY_EXISTS", "用户名已存在")
+
+    user = User(
+        username=username,
+        username_normalized=normalized,
+        password_hash=hash_password(payload.password),
+        display_name=payload.display_name.strip(),
+        role="applicant",
+        password_changed_at=now,
+    )
+    db.add(user)
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise APIError(409, "USERNAME_ALREADY_EXISTS", "用户名已存在") from None
+
+    session_token, csrf_token = _issue_session(db, user, now, ip_address, user_agent)
+    record_audit(
+        db,
+        action="auth.register",
+        resource_type="user",
+        resource_id=user.id,
+        actor_user_id=user.id,
+        outcome="success",
+        request_id=request_id,
+        ip_address=ip_address,
+    )
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise APIError(409, "USERNAME_ALREADY_EXISTS", "用户名已存在") from None
+    return user, session_token, csrf_token
+
+
+async def create_guest_session(
+    db: AsyncSession,
+    *,
+    request_id: str,
+    ip_address: str | None,
+    user_agent: str | None,
+) -> tuple[User, str, str]:
+    """签发一个游客会话：随机账号 + applicant 角色，无需密码。
+
+    用于比赛现场「扫码即用」：前端首次访问自动调用，后台管理仍须管理员登录。
+    """
+    settings = get_settings()
+    if not settings.guest_login_enabled:
+        raise APIError(403, "GUEST_LOGIN_DISABLED", "当前未开放游客访问")
+
+    now = datetime.now(UTC)
+    if ip_address is not None:
+        created = await db.scalar(
+            select(func.count(AuditLog.id)).where(
+                AuditLog.action == "auth.guest",
+                AuditLog.outcome == "success",
+                AuditLog.ip_address == ip_address,
+                AuditLog.created_at >= now - GUEST_WINDOW,
+            )
+        )
+        if int(created or 0) >= GUEST_CREATE_LIMIT:
+            raise APIError(
+                429, "GUEST_LOGIN_RATE_LIMITED", "游客会话创建过于频繁，请稍后再试"
+            )
+
+    user: User | None = None
+    for _ in range(5):
+        username = f"guest_{secrets.token_hex(4)}"
+        normalized = normalize_username(username)
+        if await db.scalar(
+            select(User.id).where(User.username_normalized == normalized)
+        ):
+            continue
+        candidate = User(
+            username=username,
+            username_normalized=normalized,
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            display_name=GUEST_DISPLAY_NAME,
+            role="applicant",
+            password_changed_at=now,
+        )
+        db.add(candidate)
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            continue
+        user = candidate
+        break
+
+    if user is None:
+        raise APIError(503, "GUEST_SESSION_UNAVAILABLE", "游客会话创建失败，请刷新重试")
+
+    session_token, csrf_token = _issue_session(db, user, now, ip_address, user_agent)
+    record_audit(
+        db,
+        action="auth.guest",
+        resource_type="user",
+        resource_id=user.id,
+        actor_user_id=user.id,
+        outcome="success",
+        request_id=request_id,
+        ip_address=ip_address,
+    )
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise APIError(
+            503, "GUEST_SESSION_UNAVAILABLE", "游客会话创建失败，请刷新重试"
+        ) from None
+    return user, session_token, csrf_token
+
+
+async def _recent_registration_denials(
+    db: AsyncSession,
+    ip_address: str,
+    now: datetime,
+) -> int:
+    count = await db.scalar(
+        select(func.count(AuditLog.id)).where(
+            AuditLog.action == "auth.register",
+            AuditLog.outcome == "denied",
+            AuditLog.ip_address == ip_address,
+            AuditLog.created_at >= now - REGISTRATION_WINDOW,
+        )
+    )
+    return int(count or 0)
 
 
 async def create_user(

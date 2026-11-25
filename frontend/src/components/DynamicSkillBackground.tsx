@@ -62,8 +62,9 @@ export default function DynamicSkillBackground() {
     const ctx = canvas.getContext('2d', { alpha: true })
     if (!ctx) return
 
-    const strands = createStrands()
-    const particles = createParticles(strands.length)
+    const isMobile = window.matchMedia('(max-width: 768px)').matches
+    const strands = isMobile ? createStrands().slice(0, 5) : createStrands()
+    const particles = isMobile ? createParticles(strands.length).slice(0, 16) : createParticles(strands.length)
     const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
     const mouse = {
       x: 0.62,
@@ -76,9 +77,12 @@ export default function DynamicSkillBackground() {
 
     let rafId = 0
     let reducedMotion = motionQuery.matches
-    let pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5)
+    let pixelRatio = isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 1.5)
     let width = 0
     let height = 0
+    let lastFrameAt = 0
+    const MIN_FRAME_MS = isMobile ? 1000 / 18 : 1000 / 32
+    const strandSteps = isMobile ? 48 : 112
 
     const pointOnStrand = (strand: Strand, progress: number, time: number) => {
       const x = progress * width
@@ -106,8 +110,8 @@ export default function DynamicSkillBackground() {
     const drawStrand = (strand: Strand, time: number, blur: boolean) => {
       ctx.beginPath()
 
-      for (let step = 0; step <= 112; step += 1) {
-        const progress = step / 112
+      for (let step = 0; step <= strandSteps; step += 1) {
+        const progress = step / strandSteps
         const point = pointOnStrand(strand, progress, time)
 
         if (step === 0) {
@@ -123,6 +127,16 @@ export default function DynamicSkillBackground() {
     }
 
     const draw = (now = 0, staticFrame = false) => {
+      // 背景是纯装饰：限帧到 32fps 并跳过标签页隐藏时的绘制，避免抢占滚动/输入的主线程时间片。
+      if (!staticFrame) {
+        if (document.hidden) return
+        if (now - lastFrameAt < MIN_FRAME_MS) {
+          rafId = requestAnimationFrame(draw)
+          return
+        }
+        lastFrameAt = now
+      }
+
       const time = staticFrame ? 18 : now * 0.00042
 
       mouse.x += (mouse.tx - mouse.x) * 0.055
@@ -149,13 +163,15 @@ export default function DynamicSkillBackground() {
       ctx.fillStyle = lowField
       ctx.fillRect(0, 0, width, height)
 
-      ctx.save()
-      ctx.globalCompositeOperation = 'screen'
-      ctx.lineCap = 'round'
-      ctx.lineJoin = 'round'
-      ctx.filter = 'blur(9px)'
-      strands.forEach((strand) => drawStrand(strand, time, true))
-      ctx.restore()
+      if (!isMobile) {
+        ctx.save()
+        ctx.globalCompositeOperation = 'screen'
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
+        ctx.filter = 'blur(9px)'
+        strands.forEach((strand) => drawStrand(strand, time, true))
+        ctx.restore()
+      }
 
       ctx.save()
       ctx.globalCompositeOperation = 'lighter'
@@ -220,7 +236,7 @@ export default function DynamicSkillBackground() {
       const bounds = canvas.parentElement?.getBoundingClientRect()
       const nextWidth = Math.max(1, Math.floor(bounds?.width || window.innerWidth))
       const nextHeight = Math.max(1, Math.floor(bounds?.height || window.innerHeight))
-      pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5)
+      pixelRatio = isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 1.5)
       width = nextWidth
       height = nextHeight
       canvas.width = Math.floor(nextWidth * pixelRatio)
@@ -240,6 +256,7 @@ export default function DynamicSkillBackground() {
     }
 
     const handlePointerMove = (event: PointerEvent) => {
+      if (event.pointerType === 'touch') return
       mouse.tx = clamp01(event.clientX / Math.max(1, window.innerWidth))
       mouse.ty = clamp01(event.clientY / Math.max(1, window.innerHeight))
       mouse.active = true
@@ -256,10 +273,19 @@ export default function DynamicSkillBackground() {
       start()
     }
 
+    const handleVisibility = () => {
+      cancelAnimationFrame(rafId)
+      if (!document.hidden && !reducedMotion) {
+        lastFrameAt = 0
+        rafId = requestAnimationFrame(draw)
+      }
+    }
+
     window.addEventListener('resize', resize)
     window.addEventListener('pointermove', handlePointerMove, { passive: true })
     window.addEventListener('pointerleave', handlePointerLeave)
     motionQuery.addEventListener('change', handleMotionChange)
+    document.addEventListener('visibilitychange', handleVisibility)
 
     start()
 
@@ -269,6 +295,7 @@ export default function DynamicSkillBackground() {
       window.removeEventListener('pointermove', handlePointerMove)
       window.removeEventListener('pointerleave', handlePointerLeave)
       motionQuery.removeEventListener('change', handleMotionChange)
+      document.removeEventListener('visibilitychange', handleVisibility)
     }
   }, [])
 

@@ -1,5 +1,7 @@
 import asyncio
 import re
+import unicodedata
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import date
 from io import BytesIO
@@ -7,19 +9,80 @@ from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
 from docx import Document
+from lxml import etree
 from pypdf import PdfReader
 
 from app.core.errors import APIError
 from app.resumes.schemas import ResumeParseResponse
 
-PDF_MEDIA_TYPES = {"application/pdf", "application/octet-stream"}
+try:
+    import pymupdf as fitz
+except ImportError:  # pragma: no cover
+    fitz = None
+
+PDF_MEDIA_TYPES = {
+    "",
+    "application/pdf",
+    "application/x-pdf",
+    "application/octet-stream",
+    "binary/octet-stream",
+    "application/wps-office.pdf",
+}
 DOCX_MEDIA_TYPE = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
-DOCX_MEDIA_TYPES = {DOCX_MEDIA_TYPE, "application/octet-stream"}
+DOCX_MEDIA_TYPES = {
+    "",
+    DOCX_MEDIA_TYPE,
+    "application/octet-stream",
+    "binary/octet-stream",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/msword",
+    "application/wps-office.docx",
+}
 MAX_RESUME_FILE_BYTES = 20 * 1024 * 1024
+MAX_RESUME_PDF_PAGES = 30
 MAX_DOCX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 MAX_EXTRACTED_TEXT_CHARS = 100_000
+MIN_NATIVE_TEXT_CHARS = 20
+MAX_OCR_IMAGES = 5
+MAX_OCR_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_OCR_TOTAL_BYTES = 12 * 1024 * 1024
+MIN_DOCX_IMAGE_BYTES = 2048
+OCR_RENDER_DPI = 150
+OCR_MAX_LONG_EDGE = 1600
+
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+MC_NS = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+DOCX_SKIP_TAGS = {
+    f"{W_NS}del",
+    f"{W_NS}instrText",
+    f"{W_NS}fldChar",
+    f"{W_NS}pPr",
+    f"{W_NS}rPr",
+    f"{W_NS}tblPr",
+    f"{W_NS}tblGrid",
+    f"{W_NS}tcPr",
+    f"{W_NS}sectPr",
+}
+DOCX_DEFERRED_TAGS = {f"{W_NS}txbxContent", f"{W_NS}tbl"}
+CN_PUNCT_MAP = str.maketrans(
+    {
+        "，": ",",
+        "。": ".",
+        "：": ":",
+        "；": ";",
+        "（": "(",
+        "）": ")",
+        "【": "[",
+        "】": "]",
+        "、": ",",
+        "—": "-",
+        "–": "-",
+        "－": "-",
+    }
+)
 
 HORIZONTAL_WHITESPACE = re.compile(r"[^\S\n]+")
 PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
@@ -56,6 +119,12 @@ class ExtractedDocument:
 
 
 @dataclass(frozen=True, slots=True)
+class ExtractedImage:
+    media_type: str
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class ValidatedParse:
     document_language: str
     summary: str | None
@@ -71,7 +140,7 @@ def detect_resume_document(filename: str, media_type: str, content: bytes) -> st
     declared_type = media_type.split(";", 1)[0].strip().lower()
 
     if extension == ".pdf":
-        if declared_type not in PDF_MEDIA_TYPES or not content.startswith(b"%PDF-"):
+        if declared_type not in PDF_MEDIA_TYPES or b"%PDF-" not in content[:1024]:
             raise _unsupported_file_type()
         return "pdf"
     if extension == ".docx":
@@ -136,6 +205,34 @@ def normalize_extracted_text(value: str) -> str:
     return normalized
 
 
+def has_sufficient_native_text(text: str) -> bool:
+    return len(re.sub(r"\s+", "", text)) >= MIN_NATIVE_TEXT_CHARS
+
+
+def extract_resume_images(path: Path, document_type: str) -> list[ExtractedImage]:
+    try:
+        if document_type == "pdf":
+            return _extract_pdf_images(path)
+        if document_type == "docx":
+            return _extract_docx_images(path)
+    except APIError:
+        raise
+    except Exception:
+        return []
+    return []
+
+
+def build_docx_from_plain_text(text: str) -> bytes:
+    normalized = normalize_extracted_text(text)
+    document = Document()
+    for line in normalized.splitlines():
+        if line:
+            document.add_paragraph(line)
+    stream = BytesIO()
+    document.save(stream)
+    return stream.getvalue()
+
+
 def redact_resume_text(value: str) -> str:
     redacted = PHONE_PATTERN.sub(_stars, value)
     redacted = EMAIL_PATTERN.sub(_stars, redacted)
@@ -147,9 +244,21 @@ def locate_evidence(text: str, quote: str) -> tuple[int, int] | None:
     if not quote:
         return None
     start = text.find(quote)
-    if start < 0:
+    if start >= 0:
+        return start, start + len(quote)
+    stripped = quote.strip(" \t\r\n\"'“”‘’")
+    if stripped and stripped != quote:
+        start = text.find(stripped)
+        if start >= 0:
+            return start, start + len(stripped)
+    norm_quote, _ = _normalize_with_map(stripped or quote)
+    if len(norm_quote) < 2:
         return None
-    return start, start + len(quote)
+    norm_text, orig_indices = _normalize_with_map(text)
+    pos = norm_text.find(norm_quote)
+    if pos < 0:
+        return None
+    return orig_indices[pos], orig_indices[pos + len(norm_quote) - 1] + 1
 
 
 def validate_parse_evidence(
@@ -260,19 +369,255 @@ def derive_total_experience_months(
 
 
 def _extract_pdf_text(path: Path) -> str:
-    reader = PdfReader(path)
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if fitz is not None:
+        text = _extract_pdf_text_pymupdf(path)
+        if text.strip():
+            return text
+        try:
+            fallback = _extract_pdf_text_pypdf(path)
+            if fallback.strip():
+                return fallback
+        except APIError:
+            raise
+        except Exception:
+            pass
+        return text
+    return _extract_pdf_text_pypdf(path)
+
+
+def _extract_pdf_text_pymupdf(path: Path) -> str:
+    assert fitz is not None
+    with fitz.open(path) as doc:
+        if doc.is_encrypted and not doc.authenticate(""):
+            raise APIError(
+                422,
+                "RESUME_DOCUMENT_INVALID",
+                "简历文档受密码保护，无法解析",
+            )
+        if doc.page_count > MAX_RESUME_PDF_PAGES:
+            raise APIError(
+                422,
+                "RESUME_PDF_TOO_MANY_PAGES",
+                f"简历请控制在 {MAX_RESUME_PDF_PAGES} 页内",
+            )
+        chunks: list[str] = []
+        for page_index in range(doc.page_count):
+            page = doc.load_page(page_index)
+            try:
+                chunks.append(page.get_text("text") or "")
+            finally:
+                del page
+        return "\n".join(chunks)
+
+
+def _extract_pdf_text_pypdf(path: Path) -> str:
+    with path.open("rb") as stream:
+        reader = PdfReader(stream)
+        page_count = len(reader.pages)
+        if page_count > MAX_RESUME_PDF_PAGES:
+            raise APIError(
+                422,
+                "RESUME_PDF_TOO_MANY_PAGES",
+                f"简历请控制在 {MAX_RESUME_PDF_PAGES} 页内",
+            )
+        pages = deque(reader.pages)
+        reader.flattened_pages = None
+        remaining_uses = Counter(id(page) for page in pages)
+        chunks: list[str] = []
+        while pages:
+            page = pages.popleft()
+            try:
+                chunks.append(page.extract_text() or "")
+            finally:
+                page_id = id(page)
+                remaining_uses[page_id] -= 1
+                if remaining_uses[page_id] == 0:
+                    page.clear()
+                del page
+        return "\n".join(chunks)
 
 
 def _extract_docx_text(path: Path) -> str:
     content = path.read_bytes()
     validate_docx_archive(content)
-    document = Document(BytesIO(content))
-    values = [paragraph.text for paragraph in document.paragraphs]
-    for table in document.tables:
-        for row in table.rows:
-            values.extend(cell.text for cell in row.cells)
-    return "\n".join(values)
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=True)
+    lines: list[str] = []
+    with ZipFile(BytesIO(content)) as archive:
+        names = set(archive.namelist())
+        ordered_parts = [
+            *sorted(
+                name
+                for name in names
+                if name.startswith("word/header") and name.endswith(".xml")
+            ),
+            "word/document.xml",
+            *sorted(
+                name
+                for name in names
+                if name.startswith("word/footer") and name.endswith(".xml")
+            ),
+        ]
+        for part_name in ordered_parts:
+            if part_name not in names:
+                continue
+            root = etree.fromstring(archive.read(part_name), parser=parser)
+            if root is None:
+                if part_name == "word/document.xml":
+                    raise ValueError("unable to parse word/document.xml")
+                continue
+            lines.extend(_extract_ooxml_lines(root))
+    return "\n".join(lines)
+
+
+def _extract_ooxml_lines(element: etree._Element) -> list[str]:
+    lines: list[str] = []
+    tag = element.tag
+    if tag in DOCX_SKIP_TAGS:
+        return lines
+    if tag == f"{MC_NS}AlternateContent":
+        choices = [child for child in element if child.tag == f"{MC_NS}Choice"]
+        targets = choices if choices else list(element)
+        for child in targets:
+            lines.extend(_extract_ooxml_lines(child))
+        return lines
+    if tag == f"{W_NS}p":
+        parts: list[str] = []
+        deferred_blocks: list[etree._Element] = []
+        _walk_paragraph_children(element, parts, deferred_blocks)
+        paragraph_text = "".join(parts)
+        if paragraph_text.strip():
+            lines.append(paragraph_text)
+        for block in deferred_blocks:
+            lines.extend(_extract_ooxml_lines(block))
+        return lines
+    for child in element:
+        lines.extend(_extract_ooxml_lines(child))
+    return lines
+
+
+def _walk_paragraph_children(
+    element: etree._Element,
+    parts: list[str],
+    deferred_blocks: list[etree._Element],
+) -> None:
+    for child in element:
+        tag = child.tag
+        if tag in DOCX_SKIP_TAGS:
+            continue
+        if tag == f"{MC_NS}AlternateContent":
+            choices = [item for item in child if item.tag == f"{MC_NS}Choice"]
+            targets = choices if choices else list(child)
+            for item in targets:
+                _walk_paragraph_children(item, parts, deferred_blocks)
+            continue
+        if tag in DOCX_DEFERRED_TAGS:
+            deferred_blocks.append(child)
+            continue
+        if tag == f"{W_NS}t":
+            if child.text:
+                parts.append(child.text)
+            continue
+        if tag == f"{W_NS}tab":
+            parts.append(" ")
+            continue
+        if tag in {f"{W_NS}br", f"{W_NS}cr"}:
+            parts.append("\n")
+            continue
+        _walk_paragraph_children(child, parts, deferred_blocks)
+
+
+def _extract_pdf_images(path: Path) -> list[ExtractedImage]:
+    if fitz is None:
+        return []
+    images: list[ExtractedImage] = []
+    total_bytes = 0
+    with fitz.open(path) as doc:
+        if doc.is_encrypted and not doc.authenticate(""):
+            return []
+        if doc.page_count > MAX_RESUME_PDF_PAGES:
+            return []
+        for page_index in range(min(doc.page_count, MAX_OCR_IMAGES)):
+            page = doc.load_page(page_index)
+            pix = None
+            try:
+                if not page.get_images(full=False) and not page.get_drawings():
+                    continue
+                rect = page.rect
+                scale = OCR_RENDER_DPI / 72.0
+                longest = max(rect.width, rect.height, 1.0)
+                if longest * scale > OCR_MAX_LONG_EDGE:
+                    scale = OCR_MAX_LONG_EDGE / longest
+                matrix = fitz.Matrix(scale, scale)
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                data = pix.tobytes("jpeg", jpg_quality=80)
+                if not data or len(data) > MAX_OCR_IMAGE_BYTES:
+                    continue
+                if total_bytes + len(data) > MAX_OCR_TOTAL_BYTES:
+                    break
+                images.append(ExtractedImage(media_type="image/jpeg", data=data))
+                total_bytes += len(data)
+            finally:
+                del pix
+                del page
+    return images
+
+
+def _extract_docx_images(path: Path) -> list[ExtractedImage]:
+    content = path.read_bytes()
+    validate_docx_archive(content)
+    images: list[ExtractedImage] = []
+    total_bytes = 0
+    with ZipFile(BytesIO(content)) as archive:
+        media_infos = sorted(
+            (
+                info
+                for info in archive.infolist()
+                if info.filename.startswith("word/media/") and not info.is_dir()
+            ),
+            key=lambda info: info.filename,
+        )
+        for info in media_infos:
+            if len(images) >= MAX_OCR_IMAGES:
+                break
+            if not (MIN_DOCX_IMAGE_BYTES <= info.file_size <= MAX_OCR_IMAGE_BYTES):
+                continue
+            data = archive.read(info.filename)
+            if not (MIN_DOCX_IMAGE_BYTES <= len(data) <= MAX_OCR_IMAGE_BYTES):
+                continue
+            media_type = _sniff_image_media_type(data)
+            if media_type is None:
+                continue
+            if total_bytes + len(data) > MAX_OCR_TOTAL_BYTES:
+                break
+            images.append(ExtractedImage(media_type=media_type, data=data))
+            total_bytes += len(data)
+    return images
+
+
+def _sniff_image_media_type(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return None
+
+
+def _normalize_with_map(source: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    indices: list[int] = []
+    for idx, ch in enumerate(source):
+        if ch.isspace():
+            continue
+        norm = unicodedata.normalize("NFKC", ch).lower().translate(CN_PUNCT_MAP)
+        for sub in norm:
+            if not sub.isspace():
+                chars.append(sub)
+                indices.append(idx)
+    return "".join(chars), indices
 
 
 def _month_index(value: str) -> int:

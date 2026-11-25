@@ -133,6 +133,11 @@ class ResumeCreatedResponse(StrictSchema):
     poll_url: str
 
 
+class ResumeTextCreateRequest(StrictSchema):
+    text: Annotated[str, Field(min_length=1, max_length=100_000)]
+    display_name: Annotated[str, Field(max_length=200)] | None = None
+
+
 class ResumeFileLinks(StrictSchema):
     id: UUID
     metadata_url: str

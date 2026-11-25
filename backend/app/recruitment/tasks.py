@@ -72,6 +72,7 @@ CANDIDATE_SAFE_MESSAGES = {
     "RESUME_DOCUMENT_INVALID": "候选简历格式或结构无效",
     "RESUME_TEXT_EMPTY": "候选简历中没有可提取文字",
     "RESUME_TEXT_TOO_LONG": "候选简历正文超过处理上限",
+    "RESUME_PDF_TOO_MANY_PAGES": "候选简历请控制在 30 页内",
     "LLM_NOT_CONFIGURED": "候选简历解析服务尚未配置",
     "LLM_TIMEOUT": "候选简历解析服务请求超时",
     "LLM_RATE_LIMITED": "候选简历解析服务暂时繁忙",

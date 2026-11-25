@@ -12,6 +12,15 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
 
 
+class RegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=8, max_length=128)
+    display_name: str = Field(min_length=1, max_length=100)
+    invite_code: str = Field(min_length=1, max_length=128)
+
+
 class UserCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
