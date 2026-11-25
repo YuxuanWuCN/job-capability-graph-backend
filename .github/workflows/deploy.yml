@@ -1,0 +1,157 @@
+name: deploy-production
+
+# 岗智融析生产部署流水线
+#
+# 设计原则（对应 AGENTS.md 红线）：
+#   1. 前端在 CI 构建，绝不在服务器构建（P0-6：2C4G 机器 npm build 会打满内存）
+#   2. 后端只上传源码，重建走 guard.sh safe-rebuild（内存门槛 1500M + prev 镜像 + 自动回滚）
+#   3. 默认手动触发。push 即上线对这台机器太危险，见 docs/同学协作与部署指南.md
+#   4. 所有服务器变更经 deploy/ci-deploy.sh → guard.sh，不自创命令
+#
+# 启用前必须在 GitHub 仓库配置：
+#   Settings → Secrets and variables → Actions → New repository secret
+#     DEPLOY_SSH_KEY   部署专用私钥全文（-----BEGIN OPENSSH PRIVATE KEY----- 开头）
+#   Settings → Environments → New environment: production
+#     勾选 Required reviewers（把自己加进去）→ 每次部署需人工点确认
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '部署目标'
+        type: choice
+        default: both
+        options:
+          - both
+          - frontend
+          - backend
+
+  # 合并/推送到 main 即自动部署。
+  # 如需改回「手动点按钮」，把下面三行注释掉即可。
+  push:
+    branches: [main]
+
+# 同一时间只允许一个部署在跑，且不取消进行中的（避免部署到一半被打断）
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      TARGET: ${{ inputs.target || 'both' }}
+      DEPLOY_HOST: 8.153.183.119
+      DEPLOY_USER: root
+      VITE_API_BASE_URL: http://8.153.183.119:8080
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        if: env.TARGET != 'backend'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 构建前端
+        if: env.TARGET != 'backend'
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+
+      - name: 前端产物自检
+        if: env.TARGET != 'backend'
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          dist = pathlib.Path('frontend/dist')
+          html = (dist / 'index.html').read_text(encoding='utf-8')
+          checks = {
+              'title_ok': '岗智融析' in html,
+              'viewport_ok': 'viewport-fit=cover' in html,
+          }
+          leaked = [
+              str(p.relative_to(dist))
+              for p in dist.rglob('*')
+              if p.suffix in {'.js', '.html', '.css'}
+              and '127.0.0.1:8000' in p.read_text(encoding='utf-8', errors='ignore')
+          ]
+          checks['no_localhost_ok'] = not leaked
+          for k, v in checks.items():
+              print(f'{k}: {v}')
+          if leaked:
+              print('泄漏文件:', leaked)
+          if not all(checks.values()):
+              sys.exit('产物自检失败，拒绝部署')
+          PY
+
+      - name: 打包产物
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" != "backend" ]; then
+            tar -czf dist.tar.gz -C frontend dist
+            echo "dist.tar.gz $(stat -c %s dist.tar.gz) bytes"
+          fi
+          if [ "$TARGET" != "frontend" ]; then
+            tar -czf backend.tar.gz \
+              --exclude='backend/.venv' \
+              --exclude='*/__pycache__' \
+              --exclude='backend/.pytest_cache' \
+              --exclude='backend/.ruff_cache' \
+              --exclude='backend/htmlcov' \
+              --exclude='backend/.coverage' \
+              backend
+            echo "backend.tar.gz $(stat -c %s backend.tar.gz) bytes"
+            tar -tzf backend.tar.gz | head -1
+          fi
+
+      - name: 配置 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$DEPLOY_SSH_KEY" ] || { echo "缺少 secret DEPLOY_SSH_KEY"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # 钉死服务器主机公钥，不用 ssh-keyscan（防中间人）
+          cat > ~/.ssh/known_hosts <<'EOF'
+          8.153.183.119 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL3bUsLVgMbRPhf3tnPscJdOV5uNQ/jCv0Q7N/tTJu01
+          EOF
+          chmod 600 ~/.ssh/known_hosts
+          ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o ConnectTimeout=15 \
+            "$DEPLOY_USER@$DEPLOY_HOST" "echo SSH_OK; hostname"
+
+      - name: 上传产物与编排脚本
+        run: |
+          set -euo pipefail
+          SSHOPT="-i $HOME/.ssh/id_deploy -o BatchMode=yes -o ConnectTimeout=15"
+          scp $SSHOPT deploy/ci-deploy.sh "$DEPLOY_USER@$DEPLOY_HOST:/root/ci-deploy.sh"
+          if [ "$TARGET" != "backend" ]; then
+            scp $SSHOPT dist.tar.gz "$DEPLOY_USER@$DEPLOY_HOST:/root/dist.tar.gz"
+          fi
+          if [ "$TARGET" != "frontend" ]; then
+            scp $SSHOPT backend.tar.gz "$DEPLOY_USER@$DEPLOY_HOST:/root/backend.tar.gz"
+          fi
+
+      - name: 执行部署
+        run: |
+          ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o ServerAliveInterval=30 \
+            "$DEPLOY_USER@$DEPLOY_HOST" "bash /root/ci-deploy.sh $TARGET"
+
+      - name: 失败时抓现场
+        if: failure()
+        run: |
+          ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o ConnectTimeout=15 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "bash /opt/job-graph/deploy/guard.sh status; echo '--- api 日志 ---'; bash /opt/job-graph/deploy/guard.sh logs api 120; echo '--- 回滚点 ---'; bash /opt/job-graph/deploy/guard.sh rollback" \
+            || echo "抓现场也失败了，去阿里云控制台看"
