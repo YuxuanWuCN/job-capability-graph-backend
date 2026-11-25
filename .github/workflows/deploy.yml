@@ -111,7 +111,8 @@ jobs:
               --exclude='backend/.coverage' \
               backend
             echo "backend.tar.gz $(stat -c %s backend.tar.gz) bytes"
-            tar -tzf backend.tar.gz | head -1
+            # 用 sed 取首行，不能用 head：head 提前关管道会让 tar 报 write error
+            tar -tzf backend.tar.gz | sed -n '1p'
           fi
 
       - name: 配置 SSH

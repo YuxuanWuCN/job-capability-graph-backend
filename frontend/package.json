@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:remote": "vite --config vite.dev-remote.config.ts --mode remote",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"

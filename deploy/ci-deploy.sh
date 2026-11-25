@@ -44,8 +44,12 @@ if [ "$TARGET" = "both" ] || [ "$TARGET" = "backend" ]; then
   [ "$SIZE" -gt 100000 ] || die "后端包过小（${SIZE}B），疑似上传失败"
 
   # 包结构自检：必须以 backend/ 开头，避免解包污染 /opt/job-graph 或 /
-  tar -tzf "$TAR" | head -1 | grep -q '^backend/' \
-    || die "包结构不对：首条目不是 backend/，拒绝解包"
+  # 用 sed 取首行；head/grep -q 会提前关管道，导致 tar 报 write error
+  FIRST=$(tar -tzf "$TAR" | sed -n '1p')
+  case "$FIRST" in
+    backend/*) ;;
+    *) die "包结构不对：首条目是 '$FIRST'，不是 backend/，拒绝解包" ;;
+  esac
 
   BAK="/root/backend-src-backup-$STAMP"
   cp -a "$ROOT/backend" "$BAK"
